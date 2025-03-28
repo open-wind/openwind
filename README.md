@@ -14,8 +14,6 @@ The toolkit also provides a streamlined process for generating different turbine
 - Wind farm developers
 - GIS analysts and data scientists
 
-![Open Wind site constraints map](/openwind-image-map.png)
-
 The toolkit outputs data in a number of industry-standard GIS formats:
 
 - `GeoJSON`
@@ -30,7 +28,7 @@ The toolkit also provides local versions of several popular GIS viewing clients 
 - [TileServer-GL](https://github.com/maptiler/tileserver-gl)
 - [GeoNode](https://geonode.org/)
 
-For an overview of how the toolkit works, see the [How it works](#how-it-works) section, below.
+For an overview of how the toolkit works, see ['How it works'](#how-it-works), below.
 
 ## Quickstart
 
@@ -55,11 +53,21 @@ Then view a simple map showing the final datasets by opening a web browser and e
 http://localhost:8000
 ```
 
-To see this map on the internet, go to [https://map.openwind.energy](https://map.openwind.energy). 
+This will display the following map:
+
+## Open Wind site constraints map
+
+![Open Wind Site Constraints Map](/openwind-image-map.png)
+
+This map is also available at [https://map.openwind.energy](https://map.openwind.energy). 
+
+The map uses vanilla Javascript, [MapLibre-GL](https://github.com/maplibre/maplibre-gl-js) and [TileServer-GL](https://github.com/maptiler/tileserver-gl) and is straightforward to modify by a developer with basic HTML / Javascript skills. 
 
 Note: the live map has been produced using the Open Wind toolkit with no changes to the underlying source code or HTML.
 
-In the event of build issues or to install Open Wind toolkit on your computer without Docker, see [INSTALL.md](INSTALL.md).
+## Installation 
+
+See [INSTALL.md](INSTALL.md). 
 
 ## Turbine-specific wind site constraints
 
