@@ -1,0 +1,47 @@
+power-hv-lines--uk:
+  types:
+    - lines
+  select:
+    - name
+    - ref
+    - power
+    - voltage
+    - operator
+  where:
+    - power IN ('line')
+
+power-lv-lines--uk:
+  types:
+    - lines
+  select:
+    - name
+    - ref
+    - power
+    - voltage
+    - operator
+  where:
+    - power IN ('minor_line')
+
+power-cables--uk:
+  types:
+    - lines
+  select:
+    - name
+    - ref
+    - power
+    - voltage
+    - operator
+  where:
+    - power IN ('cable')
+
+power-substations--uk:
+  types:
+    - polygons
+  select:
+    - name
+    - ref
+    - power
+    - voltage
+    - operator
+  where:
+    - power IN ('substation')

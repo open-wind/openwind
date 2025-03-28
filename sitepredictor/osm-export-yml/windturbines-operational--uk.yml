@@ -1,0 +1,10 @@
+windturbines-operational--uk:
+  types:
+    - points
+  select:
+    - name
+    - plant:source
+    - generator:source
+  where:
+    - plant:source = 'wind'
+    - generator:source = 'wind'

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>openwind - Latest wind constraints</title>
+
+<!-- ********************************************************************* -->
+<!-- ********************************************************************* -->
+<!-- ******** Simple HTML file to load open wind constraint layers ******* -->
+<!-- ********************************************************************* -->
+<!-- Based on: https://docs.mapbox.com/mapbox-gl-js/example/toggle-layers/ -->
+<!-- ********************************************************************* -->
+<!-- ********************************************************************* -->
+
+<meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+<link rel='stylesheet' href='https://unpkg.com/maplibre-gl@5.2.0/dist/maplibre-gl.css' />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&icon_names=visibility" />
+<script src='https://unpkg.com/maplibre-gl@5.2.0/dist/maplibre-gl.js'></script>
+<script src="datasets-latest-style.js"></script>
+<style>
+body { margin: 0; padding: 0; }
+#map { position: absolute; top: 0; bottom: 0; width: 100%; }
+</style>
+</head>
+<body>
+<style>
+
+    body {
+        font-family: 'Open Sans', sans-serif;
+    }
+
+    #menu {
+        position: absolute;
+        z-index: 1;
+        top: 10px;
+        left: 10px;
+        border-radius: 3px;
+        max-width: 250px;
+        text-overflow: ellipsis;
+    }
+
+    #menu a {
+        font-size: 12px;
+        color: #ffffff;
+        display: block;
+        margin: 0;
+        padding: 0;
+        padding: 4px 10px 4px 10px;
+        text-decoration: none;
+        opacity: 0.65;
+        text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.9);
+        text-align: left;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    #menu a:last-child {
+        border: none;
+    }
+
+    #menu a.active {
+        opacity: 1;
+    }
+
+    #info {
+        position: absolute;
+        font-size: 12px;
+        margin-left: calc((100vw - 320px)/2);;
+        bottom: 60px;
+        width: 300px;
+        z-index: 1000;
+        text-align: center;
+        padding: 10px;
+        background: #ffffffcf;
+        border-radius: 20px;
+    }
+
+    div.spacer {
+        height: 3px;
+    }
+
+    div.link_container {
+        background: #fff;
+        opacity: 0.9;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.114);
+    }
+
+    @media only screen and (max-width: 600px) {
+        #menu {
+            top: 0px;
+            left: 0px;
+            max-width: 120px;
+        }
+        #menu a {
+            font-size: 8px;
+            padding: 3px 4px 3px 4px;
+        }
+        div.spacer {
+            height: 0px;
+        }
+    }
+</style>
+
+<div id="info"></div>
+<nav id="menu"></nav>
+<div id="map"></div>
+
+<script>
+
+    const map = new maplibregl.Map({
+        container: 'map',
+        style: 'http://localhost:8080/styles/openwind/style.json',
+        zoom: 5.2,
+        maxPitch: 85,
+        minZoom: 5,
+        maxBounds: [[-49.262695,38.548165], [39.990234,64.848937]],        
+        center: [-6, 55.273]
+    });
+
+    map.addControl(
+        new maplibregl.NavigationControl({
+            visualizePitch: true,
+            showZoom: true,
+            showCompass: true
+        })
+    );
+
+    // Wait until map has finished loading
+    map.on('load', () => {
+
+        const info = document.getElementById('info');
+        info.innerHTML = 'Wind constraints for turbine height to tip: <b>' + openwind_structure.tipheight + 'm</b>';
+
+        // Iterate through openwind datasets to produce list of menu items
+        const datasets = openwind_structure.datasets;
+        var menu_links = [];
+        for(var dataset_index = 0; dataset_index < datasets.length; dataset_index++) {
+            menu_links.push(datasets[dataset_index]);
+            if (datasets[dataset_index].children !== undefined) {
+                const children = datasets[dataset_index].children;
+                for (var children_index = 0; children_index < children.length; children_index++) {
+                    menu_links.push(children[children_index]);
+                }
+            }
+        }
+
+        for(var menu_index = 0; menu_index < menu_links.length; menu_index++) {
+            const menuitems = document.getElementById('menu');
+            const openwind_dataset = menu_links[menu_index];
+            const id = openwind_dataset['dataset'];
+
+            // Add spacer
+            if ((menu_index !== 0) && (openwind_dataset.level == 1)) {
+                const spacer = document.createElement('div');
+                spacer.className = 'spacer';
+                spacer.innerHTML = ' ';
+                menuitems.appendChild(spacer);
+            }
+
+            // Ad-hoc colour change to improve visibility of text
+            if (openwind_dataset.color == 'chartreuse') openwind_dataset.color = '#5eb507';
+
+            // Create link
+            const link_container = document.createElement('div');
+            link_container.className = 'link_container';
+            const link = document.createElement('a');
+
+            link.id = openwind_dataset['dataset'];
+            link.href = '#';
+            link.style.backgroundColor = openwind_dataset.color;
+            link.style.fontWeight = (openwind_dataset.level == 1) ? '600': '300';
+            link.innerHTML = ((openwind_dataset.level == 1) ? openwind_dataset.title : '&bull;&nbsp;' + openwind_dataset.title);
+            link.className = openwind_dataset.defaultactive ? 'active' : '';
+
+            // Show or hide layer when the toggle is clicked
+            link.onclick = function (e) {
+                const clickedLayer = this.id;
+                e.preventDefault();
+                e.stopPropagation();
+                
+                const visibility = map.getLayoutProperty(
+                    clickedLayer,
+                    'visibility'
+                );
+
+                // Toggle layer visibility by changing the layout object's visibility property
+                if (visibility === 'visible') {
+                    this.className = '';
+                    map.setLayoutProperty(clickedLayer, 'visibility', 'none');
+                } else {
+                    this.className = 'active';
+                    map.setLayoutProperty(
+                        clickedLayer,
+                        'visibility',
+                        'visible'
+                    );
+                }
+            };
+
+            link_container.appendChild(link);
+            menuitems.appendChild(link_container);
+        }
+    });
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,16 @@
+osmium~=3.5.0
+pyparsing~=2.4.0
+pyyaml~=5.1.1
+requests~=2.26.0
+landez~=2.5.0
+deepdiff~=5.8.1
+geopandas==0.14.4
+numpy==1.26.4
+python-dotenv
+psycopg2-binary
+ckanapi
+owslib
+xmltodict
+
+# geojson
+# turfpy

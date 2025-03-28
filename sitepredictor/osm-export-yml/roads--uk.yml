@@ -1,0 +1,31 @@
+motorways--uk:
+  types:
+    - lines
+  select:
+    - highway
+  where:
+    - highway IN ('motorway','motorway_link')
+
+a-roads--uk:
+  types:
+    - lines
+  select:
+    - highway
+  where:
+    - highway IN ('trunk','trunk_link','primary','primary_link')
+
+b-roads--uk:
+  types:
+    - lines
+  select:
+    - highway
+  where:
+    - highway IN ('secondary','secondary_link')
+
+minor-roads--uk:
+  types:
+    - lines
+  select:
+    - highway
+  where:
+    - highway IN ('tertiary','tertiary_link', 'road', 'service', 'residential', 'raceway', 'track', 'unclassified')

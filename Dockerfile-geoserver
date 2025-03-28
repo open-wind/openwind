@@ -1,0 +1,48 @@
+ARG BASE_IMAGE_VERSION
+FROM geonode/geoserver:${BASE_IMAGE_VERSION}
+
+
+# Install geoserver-vectortiles extensions
+
+WORKDIR /usr/src
+RUN mkdir geoserver-vectortiles
+RUN wget https://sourceforge.net/projects/geoserver/files/GeoServer/2.24.5/extensions/geoserver-2.24.5-vectortiles-plugin.zip -O geoserver-vectortiles-plugin.zip
+WORKDIR /usr/src/geoserver-vectortiles
+RUN unzip ../geoserver-vectortiles-plugin.zip
+RUN mv -f *.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/.
+
+
+# Install geoserver-mbtiles and geoserver-mbtiles-store extensions
+
+WORKDIR /usr/src
+RUN mkdir geoserver-mbtiles
+RUN wget https://build.geoserver.org/geoserver/2.24.x/community-latest/geoserver-2.24-SNAPSHOT-mbtiles-plugin.zip -O geoserver-mbtiles-plugin.zip
+WORKDIR /usr/src/geoserver-mbtiles
+RUN unzip ../geoserver-mbtiles-plugin.zip
+RUN mv -f *.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/.
+
+WORKDIR /usr/src
+RUN mkdir geoserver-mbtiles-store
+RUN wget https://build.geoserver.org/geoserver/2.24.x/community-latest/geoserver-2.24-SNAPSHOT-mbtiles-store-plugin.zip -O geoserver-mbtiles-store-plugin.zip
+WORKDIR /usr/src/geoserver-mbtiles-store
+RUN unzip ../geoserver-mbtiles-store-plugin.zip
+RUN mv -f *.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/.
+
+WORKDIR /usr/src
+RUN mkdir geoserver-wps
+RUN wget https://build.geoserver.org/geoserver/2.24.x/ext-latest/geoserver-2.24-SNAPSHOT-wps-plugin.zip -O geoserver-wps.zip
+WORKDIR /usr/src/geoserver-wps
+RUN unzip ../geoserver-wps.zip
+RUN mv -f *.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/.
+
+WORKDIR /usr/src
+RUN mkdir geoserver-csw
+RUN wget https://build.geoserver.org/geoserver/2.24.x/ext-latest/geoserver-2.24-SNAPSHOT-csw-plugin.zip -O geoserver-csw.zip
+WORKDIR /usr/src/geoserver-csw
+RUN unzip ../geoserver-csw.zip
+RUN mv -f *.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/.
+
+
+
+
+

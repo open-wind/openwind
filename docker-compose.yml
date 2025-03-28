@@ -1,0 +1,55 @@
+# openwind docker-compose.yml
+
+services:
+
+  openwind-postgis:
+    container_name: openwind-postgis
+    image: kartoza/postgis:17-3.5
+    restart: always
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_DB: $POSTGRES_DB
+      POSTGRES_USER: $POSTGRES_USER
+      POSTGRES_PASSWORD: $POSTGRES_PASSWORD 
+      PGHOST: "/var/run/postgresql"
+      PGPORT: "5432"
+    hostname: openwind-postgis
+    volumes:
+      - ./build-docker/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  openwind-fonts:
+    container_name: openwind-fonts
+    volumes:
+      - ./build-docker:/build-docker
+    # Force linux/amd64 emulation as 'npm i -g fontnik' doesn't complete on arch64 
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: openwind-fonts.dockerfile
+
+  openwind-build:
+    container_name: openwind-build
+    volumes:
+      - ./build-docker:/usr/src/openwind/build-docker
+      - ./build-docker/coastline:/usr/src/openwind/coastline
+      - ./build-docker/landcover:/usr/src/openwind/landcover
+    environment:
+      POSTGRES_HOST: openwind-postgis
+      POSTGRES_DB: $POSTGRES_DB
+      POSTGRES_USER: $POSTGRES_USER
+      POSTGRES_PASSWORD: $POSTGRES_PASSWORD 
+      BUILD_FOLDER: "build-docker/"
+    build:
+      context: .
+      dockerfile: openwind-build.dockerfile
+    depends_on:
+      openwind-postgis:
+        condition: service_healthy
+    stdin_open: true
+    tty: true

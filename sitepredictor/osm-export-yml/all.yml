@@ -1,0 +1,83 @@
+a-roads--uk:
+  select:
+  - highway
+  types:
+  - lines
+  where:
+  - highway IN ('trunk','trunk_link','primary','primary_link')
+b-roads--uk:
+  select:
+  - highway
+  types:
+  - lines
+  where:
+  - highway IN ('secondary','secondary_link')
+minor-roads--uk:
+  select:
+  - highway
+  types:
+  - lines
+  where:
+  - highway IN ('tertiary','tertiary_link', 'road', 'service', 'residential', 'raceway',
+    'track', 'unclassified')
+motorways--uk:
+  select:
+  - highway
+  types:
+  - lines
+  where:
+  - highway IN ('motorway','motorway_link')
+power-cables--uk:
+  select:
+  - name
+  - ref
+  - power
+  - voltage
+  - operator
+  types:
+  - lines
+  where:
+  - power IN ('cable')
+power-hv-lines--uk:
+  select:
+  - name
+  - ref
+  - power
+  - voltage
+  - operator
+  types:
+  - lines
+  where:
+  - power IN ('line')
+power-lv-lines--uk:
+  select:
+  - name
+  - ref
+  - power
+  - voltage
+  - operator
+  types:
+  - lines
+  where:
+  - power IN ('minor_line')
+power-substations--uk:
+  select:
+  - name
+  - ref
+  - power
+  - voltage
+  - operator
+  types:
+  - polygons
+  where:
+  - power IN ('substation')
+windturbines-operational--uk:
+  select:
+  - name
+  - plant:source
+  - generator:source
+  types:
+  - points
+  where:
+  - plant:source = 'wind'
+  - generator:source = 'wind'
