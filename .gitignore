@@ -1,3 +1,5 @@
+*.png binary
+*.pbf binary
 .DS_Store
 .env
 venv/
