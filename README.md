@@ -14,7 +14,7 @@ The toolkit also provides a streamlined process for generating different turbine
 - Wind farm developers
 - GIS analysts and data scientists
 
-![Open Wind site constraints map](openwind-image-map.png)
+![Open Wind site constraints map](/openwind-image-map.png)
 
 The toolkit outputs data in a number of industry-standard GIS formats:
 
