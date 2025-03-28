@@ -789,7 +789,7 @@ def postgisGetUKBasicUnprocessedTables():
     table_name NOT LIKE '%%__3857';
     """, (POSTGRES_DB, ))
     basic_unprocessed = [list_item[0] for list_item in basic_unprocessed]
-    print(json.dumps(basic_unprocessed, indent=4))
+
     basic_unprocessed_filtered = []
     for item in basic_unprocessed:
         if (item + '__pro') not in basic_processed: basic_unprocessed_filtered.append(item)
@@ -1565,6 +1565,35 @@ def getSpecificCensusSingleGeography(position, category):
     
     return results
 
+def groupAgeData(result):
+    """
+    Groups fine-grained age data into smaller 'number_ranges' groups
+    eg. if number_ranges = 5 then groups of 0-19, 20-39, etc (and add in 100 to 80-99)
+    """
+
+    number_ranges = 10
+
+    result['age_0'] = result['age_under_1']
+    result['age_100'] = result['age_100_over']
+
+    final_result = {'total': result['total']}
+    for step_index in range(number_ranges):
+
+        step_start = step_index * number_ranges
+        step_end = ((step_index + 1) * number_ranges) - 1
+        step_total = 0
+
+        for individual_step_index in range(step_start, step_end + 1):
+            step_total += int(result['age_' + str(individual_step_index)])
+
+        if step_index == (number_ranges - 1):
+            step_end += 1 
+            step_total += int(result['age_' + str(step_end)])
+
+        final_result['age_range_' + str(step_start) + "_" + str(step_end)] = step_total
+
+    return final_result
+
 def getSpecificCensusSearchRadius(position, category, radius):
     """
     Gets aggregated census data for all geographies within radius of position using category
@@ -1589,12 +1618,15 @@ def getSpecificCensusSearchRadius(position, category, radius):
     aggregateresults = {}
     delete_fields = ['ogc_fid', 'geo_code', 'date', 'geography', 'geom']
     for result in results:
-        for field in result.keys():
+        # Existing age data is broken down by year which is too much granularity so aggregate
+        final_result = result
+        if category == 'age': final_result = groupAgeData(result)
+        for field in final_result.keys():
             if field in delete_fields: continue
             # As we're summing all values, proportional '__pro' field should be ignored
             if '__pro' in field: continue
-            if field not in aggregateresults: aggregateresults[field] = int(result[field])
-            else: aggregateresults[field] += int(result[field])
+            if field not in aggregateresults: aggregateresults[field] = int(final_result[field])
+            else: aggregateresults[field] += int(final_result[field])
 
     total = aggregateresults['total']
     del aggregateresults['total']
@@ -1746,7 +1778,7 @@ def getViewshedOverlaps(position, height, categories):
 
     specialcases = {
         'listed_buildings__uk__pro__3857': {
-            'multiply_number_points_by_area': 3.14 * 50 * 50
+            'multiply_number_points_by_area': (3.14 * 50 * 50) / 1000000
         }
     }
 
@@ -2078,7 +2110,7 @@ def runSitePredictor():
         # Get demographics for a number of radius circles
         for census_radius in [10, 20, 30, 40]:        
             census = getCensus(turbine_lnglat, census_radius * 1000)
-            for census_key in census.keys(): turbine[str(census_radius) + 'km_' + census_key] = census[census_key]
+            for census_key in census.keys(): turbine[str(census_radius) + 'km_radius_' + census_key] = census[census_key]
 
         political = [{
             'political_con': None,
