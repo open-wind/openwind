@@ -305,7 +305,7 @@ buffers:
   inland-waters--uk:
     1.1 * height-to-tip
   separation-distance-from-residential--uk:
-    6 * blade-radius
+    8 * blade-radius
   ...
 
 # Colours to use for each dataset group when displaying final data layers

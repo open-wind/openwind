@@ -56,6 +56,9 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 import multiprocessing
+import hashlib
+import glob
+from h2o.estimators.deeplearning import H2ODeepLearningEstimator
 from multiprocessing import Pool, Value
 from rasterio.transform import from_origin
 from datetime import datetime
@@ -131,6 +134,7 @@ BATCH_SAMPLING_GRID                 = "sitepredictor__batch_points"
 TEST_SAMPLING_GRID_SIZE             = 16000
 QUIET_MODE                          = True
 RASTER_OUTPUT_FOLDER                = WORKING_FOLDER + "rasters/"
+if os.environ.get("RASTER_OUTPUT_FOLDER") is not None: RASTER_OUTPUT_FOLDER = os.environ.get("RASTER_OUTPUT_FOLDER")
 GEOCODE_POSITION_LOOKUP             = {}
 COUNCIL_POSITION_LOOKUP             = {}
 CENSUS_CACHE                        = {}
@@ -142,15 +146,21 @@ OUTPUT_ML_GEOJSON                   = OUTPUT_FOLDER + 'output-machinelearning.ge
 OUTPUT_ML_CSV                       = OUTPUT_FOLDER + 'output-machinelearning.csv'
 OUTPUT_ML_RASTER                    = OUTPUT_FOLDER + 'output-machinelearning.tif'
 ML_FOLDER                           = WORKING_FOLDER + "machinelearning/"
+PASSES_FOLDER                       = WORKING_FOLDER + "passes/"
 # ML_MAX_RUNTIME_SECS                 = 5*60
 ML_MAX_RUNTIME_SECS                 = 30*60
-ML_MAX_MODELS                       = 10
+ML_MAX_MODELS                       = 20
+# ML_MAX_MODELS                       = 3
 ML_STATUS_SUCCESS                   = ['Operational', 'Awaiting Construction', 'Under Construction', 'Decommissioned', 'Planning Permission Expired']
 ML_STATUS_FAILURE                   = ['Application Refused', 'Abandoned', 'Appeal Withdrawn', 'Application Withdrawn', 'Appeal Refused']
 ML_STATUS_PENDING                   = ['Revised', 'Application Submitted', 'Appeal Lodged', 'No Application Required']
 ALLTURBINES_DF                      = None
+ALLTURBINES_GDF                     = None
 CKAN_USER_AGENT                     = 'ckanapi/1.0 (+https://openwind.energy)'
 LOG_SINGLE_PASS                     = WORKING_FOLDER + '../log.txt'
+TEST_POINT                          = {'lng': 0, 'lat': 51} # In --test, use only one sample grid square containing TEST_POINT
+MAX_RANDOM_STDDEV                   = 0.2887
+NODATA_VALUE                        = -9999
 
 # We try and include as many columns as possible to ML
 # but there are some columns that are clearly irrelevant to prediction
@@ -390,6 +400,14 @@ MAXIMUM_DISTANCE_LINE               = 50
 # ***************** General helper functions ****************
 # ***********************************************************
 
+def hash_dataframe(df: pd.DataFrame) -> str:
+    """
+    Create a reproducible hash of a DataFrame, including row order and content.
+    """
+
+    df_bytes = pd.util.hash_pandas_object(df, index=True).values.tobytes()
+    return hashlib.sha256(df_bytes).hexdigest()
+
 def initLogging():
     """
     Initialises logging
@@ -580,6 +598,7 @@ def runSubprocess(subprocess_array):
 
     if output.returncode != 0:
         LogError("subprocess.run failed with error code: " + str(output.returncode) + '\n' + " ".join(subprocess_array))
+        exit()
     return " ".join(subprocess_array)
 
 def getGPKGProjection(file_path):
@@ -882,7 +901,7 @@ def createCappedDistanceRaster(input, output, capvalue):
                     "--outfile=" + output, \
                     '--calc="(A*(A<=' + str(capvalue) + '))+(' + str(capvalue) + '*(A>' + str(capvalue) + '))"' ])
 
-def createRasterFromGeoJSON(raster_resolution, geojson_path, raster_path):
+def createRasterFromGeoJSON(runtest, batch_grid_spacing, raster_resolution, geojson_path, raster_path):
     """
     Creates raster from GeoJSON
     """
@@ -890,7 +909,7 @@ def createRasterFromGeoJSON(raster_resolution, geojson_path, raster_path):
     global OUTPUT_ML_CSV
 
     gridsquare_offset_negative = int(raster_resolution / 2)
-    output_ml = buildOutputPath(OUTPUT_ML_CSV, raster_resolution)
+    output_ml = buildOutputPath(runtest, OUTPUT_ML_CSV, batch_grid_spacing, raster_resolution)
 
     raster_data = getJSON(geojson_path)
 
@@ -926,8 +945,8 @@ def createRasterFromGeoJSON(raster_resolution, geojson_path, raster_path):
     raster = np.full((height, width), nodata_val, dtype=np.float32)
 
     for _, row in df.iterrows():
-        col = int((row["easting"] - x_min) / raster_resolution)
-        row_idx = int((y_max - row["northing"]) / raster_resolution)
+        col = round((row["easting"] - x_min) / raster_resolution)
+        row_idx = round((y_max - row["northing"]) / raster_resolution)
         raster[row_idx, col] = row["probability"]
 
     transform = from_origin(x_min - gridsquare_offset_negative, y_max + gridsquare_offset_negative, raster_resolution, raster_resolution)
@@ -1171,6 +1190,26 @@ def postgisAddProportionalFields(table):
 
         postgisExec('ALTER TABLE %s ADD COLUMN %s FLOAT;', (AsIs(table), AsIs(proportional_field), ))
         postgisExec('UPDATE %s SET %s = (%s::float / total::float)', (AsIs(table), AsIs(proportional_field), AsIs(field), ))
+
+def postgisGetTableBounds(table_name):
+    """
+    Get bounds of all geometries in table
+    """
+
+    global POSTGRES_HOST, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+
+    conn = psycopg2.connect(host=POSTGRES_HOST, dbname=POSTGRES_DB, user=POSTGRES_USER, password=POSTGRES_PASSWORD)
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT 
+        MIN(easting) AS left,
+        MIN(northing) AS bottom,
+        MAX(easting) AS right,
+        MAX(northing) AS top FROM %s;
+    """, (AsIs(table_name), ))
+    left, bottom, right, top = cur.fetchone()
+    conn.close()
+    return {'left': left, 'bottom': bottom, 'right': right, 'top': top}
 
 def postgisGetBasicProcessedTables():
     """
@@ -1417,26 +1456,6 @@ def postgisAmalgamateAndDissolve(target_table, child_tables):
 
     postgisExec("CREATE INDEX %s ON %s USING GIST (geom);", (AsIs(target_table + "_idx"), AsIs(target_table), ))
 
-def postgisGetTableBounds(table_name):
-    """
-    Get bounds of all geometries in table
-    """
-
-    global POSTGRES_HOST, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
-
-    conn = psycopg2.connect(host=POSTGRES_HOST, dbname=POSTGRES_DB, user=POSTGRES_USER, password=POSTGRES_PASSWORD)
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT 
-        MIN(ST_XMin(geom)) left,
-        MIN(ST_YMin(geom)) bottom,
-        MAX(ST_XMax(geom)) right,
-        MAX(ST_YMax(geom)) top FROM %s;
-    """, (AsIs(table_name), ))
-    left, bottom, right, top = cur.fetchone()
-    conn.close()
-    return {'left': left, 'bottom': bottom, 'right': right, 'top': top}
-
 def postgisDistanceToNearestFeatureNonCache(position, dataset_table):
     """
     Gets distance of turbine from specific feature layer using direct PostGIS query
@@ -1594,13 +1613,14 @@ def removeNonHistoricalTables(table_list):
 
     return final_tables
 
-def buildOutputPath(basepath, raster_resolution):
+def buildOutputPath(runtest, basepath, batch_grid_spacing, raster_resolution):
     """
     Builds output path adding raster_resolution
     """
 
     outputpath_dir = os.path.dirname(basepath)
     outputpath_basename = basename(basepath)
+    if runtest: outputpath_basename = 'test--' + str(batch_grid_spacing) + '-m-' + outputpath_basename
     outputpath_basename_elements = outputpath_basename.split('.')
 
     output_path = join(outputpath_dir, outputpath_basename_elements[0] + '--' + str(raster_resolution) + "-m." + outputpath_basename_elements[1])
@@ -1666,11 +1686,12 @@ def buildBatchGridOutputGeoTIFF(output_data, batch_index, batch_grid_spacing):
 
     return buildBatchFilename(output_data, batch_index, batch_grid_spacing) + '.tif'
 
-def buildBatchGridTableName(batch_grid_spacing):
+def buildBatchGridTableName(runtest, batch_grid_spacing):
     """
     Builds batch grid table name
     """
 
+    if runtest: return "sitepredictor__test_batch_grid__spc_" + str(batch_grid_spacing) + "_m__uk" 
     return "sitepredictor__batch_grid__spc_" + str(batch_grid_spacing) + "_m__uk"
 
 def buildBatchCellTableName(batch_index, batch_grid_spacing):
@@ -1712,10 +1733,14 @@ def machinelearningInitialize():
 
     LogMessage("Initializing h2o machine learning")
 
+    os.environ["JAVA_OPTIONS"] = "-XX:ActiveProcessorCount=4"
+
     try:
         h2o.init(start_h2o=False)
     except Exception as e:
         h2o.init()
+
+    h2o.remove_all()  # Ensure clean environment
 
     makeFolder(ML_FOLDER)
 
@@ -1757,7 +1782,7 @@ def machinelearningGetSavedModel():
 
     return ML_FOLDER + savedmodels[0]
 
-def machinelearningBuildModel():
+def machinelearningBuildModel(pass_index):
     """
     Builds machine learning model using AutoML - h2o
     """
@@ -1770,7 +1795,11 @@ def machinelearningBuildModel():
     machinelearningInitialize()
 
     # Load dataset to use for training
-    df_train = machinelearningPrepareTrainingData()
+    df_train = machinelearningPrepareTrainingData(pass_index)
+
+    # Create hash for reproducibility audit
+    df_hash = hash_dataframe(df_train)
+    LogMessage("Data hash before AutoML: " + df_hash)
 
     # Set up machine learning training set
     h2o_frame = h2o.H2OFrame(df_train)
@@ -1781,20 +1810,45 @@ def machinelearningBuildModel():
     LogMessage("Running machine learning training using training data")
 
     # Run machine learning on training set
-    # h2o_automl = H2OAutoML(sort_metric='mse', max_runtime_secs=ML_MAX_RUNTIME_SECS, seed=666)
-    h2o_automl = H2OAutoML(sort_metric='mse', max_models=ML_MAX_MODELS, seed=666)
-    h2o_automl.train(x=x, y=y, training_frame=h2o_frame)
+    # h2o_automl = H2OAutoML(sort_metric='mse', max_runtime_secs=ML_MAX_RUNTIME_SECS, seed=pass_index)
+    ML_MAX_MODELS = 40
+    # h2o_automl = H2OAutoML(sort_metric='mse', max_models=ML_MAX_MODELS, seed=pass_index, exclude_algos = ["DeepLearning", "XGBoost"], keep_cross_validation_predictions=True)
+    # h2o_automl = H2OAutoML(sort_metric='mse', max_models=ML_MAX_MODELS, seed=pass_index, include_algos = ["DeepLearning"], keep_cross_validation_predictions=True)
+    # h2o_automl.train(x=x, y=y, training_frame=h2o_frame)
 
-    # Show final leaderboard of AutoML machine learning to user
-    h2o_models = h2o.automl.get_leaderboard(h2o_automl, extra_columns = "ALL")
-    print(h2o_models)
+    # # Show final leaderboard of AutoML machine learning to user
+    # h2o_models = h2o.automl.get_leaderboard(h2o_automl, extra_columns = "ALL")
+    # print(h2o_models)
+
+    # # Delete any existing models
+    # machinelearningDeleteSavedModels()
+
+    # # Save 'leader', ie. most optimized model, of all machine learning models
+    # LogMessage("Saving machine learning model")
+    # h2o.save_model(model=h2o_automl.leader, path=ML_FOLDER, force=True)
+
+    h2o_model = H2ODeepLearningEstimator(
+        activation="MaxoutWithDropout",
+        hidden=[200, 200, 200, 200, 200, 200, 200, 200],
+        input_dropout_ratio=0.1,
+        hidden_dropout_ratios=[0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+        epochs=1000,
+        l1=1e-5,
+        l2=1e-5,
+        adaptive_rate=True,
+        seed=1234,
+        stopping_metric="AUTO",  # or use "MSE", "AUC", etc.
+        stopping_rounds=5,
+        stopping_tolerance=1e-4
+    )
+    h2o_model.train(x=x, y=y, training_frame=h2o_frame)
 
     # Delete any existing models
     machinelearningDeleteSavedModels()
 
-    # Save 'leader', ie. most optimized model, of all machine learning models
+    # Save single specific model
     LogMessage("Saving machine learning model")
-    h2o.save_model(model=h2o_automl.leader, path=ML_FOLDER, force=True)
+    h2o.save_model(model=h2o_model, path=ML_FOLDER, force=True)
 
 def machinelearningTestModel(df_test):
     """
@@ -1826,7 +1880,7 @@ def machinelearningTestModel(df_test):
 
     return df_predicted
 
-def machinelearningPrepareTrainingData():
+def machinelearningPrepareTrainingData(pass_index):
     """
     Prepares training data for machine learning
     """
@@ -1838,8 +1892,8 @@ def machinelearningPrepareTrainingData():
     # Load dataset
     df = pd.read_csv(OUTPUT_DATA_ALLTURBINES, delimiter=',', low_memory=False)
 
-    # Randomly shuffle all rows so any test subset contains mix of success values
-    df = df.sample(frac=1)
+    # # Randomly shuffle all rows so any test subset contains mix of success values
+    df = df.sample(frac=1, random_state=pass_index)
 
     # Use 'project_date_end' as 'date_time' x-axis - useful for displaying all results on plot
     df['date_time'] = pd.to_datetime(df['project_date_end'], format='%Y-%m-%d')
@@ -1870,59 +1924,70 @@ def machinelearningPrepareTrainingData():
 
     return df_train
 
-def machinelearningRunModelOnSamplingGrid(raster_resolution):
+def machinelearningRunModelOnSamplingGrid(runtest, batch_grid_spacing, raster_resolution):
     """
     Runs machine learning model on sample grid
     """
 
-    global OUTPUT_DATA_SAMPLEGRID
+    global OUTPUT_DATA_SAMPLEGRID, OUTPUT_ML_GEOJSON, OUTPUT_ML_RASTER
 
-    output_data = buildOutputPath(OUTPUT_DATA_SAMPLEGRID, raster_resolution)
+    output_data = buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, raster_resolution)
+    output_ml_geojson = buildOutputPath(runtest, OUTPUT_ML_GEOJSON, batch_grid_spacing, raster_resolution)
+    output_ml_geotiff = buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, raster_resolution)
 
-    # Initialize machine learning
-    machinelearningInitialize()
+    if not isfile(output_ml_geojson):
 
-    # Load dataset to test
-    df_samplegrid = pd.read_csv(output_data, delimiter=',', low_memory=False)
+        # Initialize machine learning
+        machinelearningInitialize()
 
-    # Use project_date_end as date_time x-axis
-    df_samplegrid['date_time'] = pd.to_datetime(df_samplegrid['project_date_end'], format='%Y-%m-%d')
-    df_samplegrid = df_samplegrid.set_index('date_time').sort_index()
+        # Load dataset to test
+        LogMessage("Loading dataset to test")
+        df_samplegrid = pd.read_csv(output_data, delimiter=',', low_memory=False)
 
-    # Make copy of sample grid before we make further changes so we
-    # can use when generating output results (GeoJSON or GeoTIFF)
-    df_original = df_samplegrid.copy()
+        # Use project_date_end as date_time x-axis
+        df_samplegrid['date_time'] = pd.to_datetime(df_samplegrid['project_date_end'], format='%Y-%m-%d')
+        df_samplegrid = df_samplegrid.set_index('date_time').sort_index()
 
-    # Remove extraneous columns
-    for column_to_remove in ML_IGNORE_COLUMNS:
-        if column_to_remove in df_samplegrid:
-            df_samplegrid = df_samplegrid.drop(column_to_remove, axis=1)
+        # Make copy of sample grid before we make further changes so we
+        # can use when generating output results (GeoJSON or GeoTIFF)
+        LogMessage("Copying dataset")
+        df_original = df_samplegrid.copy()
 
-    # Load saved machine leraning model
-    model_path = machinelearningGetSavedModel()
-    h2o_automl = h2o.load_model(model_path)
+        # Remove extraneous columns
+        LogMessage("Removing extraneous columns")
+        for column_to_remove in ML_IGNORE_COLUMNS:
+            if column_to_remove in df_samplegrid:
+                df_samplegrid = df_samplegrid.drop(column_to_remove, axis=1)
 
-    # Build dataframe from sample grid
-    h2o_frame_test = h2o.H2OFrame(df_samplegrid)
+        # Load saved machine leraning model
+        LogMessage("Loading machine learning model")
+        model_path = machinelearningGetSavedModel()
+        h2o_automl = h2o.load_model(model_path)
 
-    # Run machine learning model with sample grid data
-    LogMessage("Applying machine learning model to new data")
-    y_pred = h2o_automl.predict(h2o_frame_test)
+        # Build dataframe from sample grid
+        LogMessage("Loading dataset to test")
+        h2o_frame_test = h2o.H2OFrame(df_samplegrid)
 
-    df_predicted = y_pred.as_data_frame().to_numpy().ravel()
-    print(y_pred.as_data_frame())
+        # Run machine learning model with sample grid data
+        LogMessage("Applying machine learning model to new data")
+        y_pred = h2o_automl.predict(h2o_frame_test)
 
-    machinelearningOutputGridResults(raster_resolution, df_original, df_predicted)
+        df_predicted = y_pred.as_data_frame().to_numpy().ravel()
+        print(y_pred.as_data_frame())
 
-def machinelearningOutputGridResults(raster_resolution, df_original, df_predicted):
+        machinelearningOutputGridResultsAsGeoJSON(runtest, batch_grid_spacing, raster_resolution, df_original, df_predicted)
+
+    if not isfile(output_ml_geotiff):
+        createRasterFromGeoJSON(runtest, batch_grid_spacing, raster_resolution, output_ml_geojson, output_ml_geotiff)
+
+def machinelearningOutputGridResultsAsGeoJSON(runtest, batch_grid_spacing, raster_resolution, df_original, df_predicted):
     """
     Output results of machine learning predictions for array of points
     """
 
-    global OUTPUT_ML_GEOJSON, OUTPUT_ML_RASTER
+    global OUTPUT_ML_GEOJSON
 
-    output_ml_geojson = buildOutputPath(OUTPUT_ML_GEOJSON, raster_resolution)
-    output_ml_geotiff = buildOutputPath(OUTPUT_ML_RASTER, raster_resolution)
+    output_ml_geojson = buildOutputPath(runtest, OUTPUT_ML_GEOJSON, batch_grid_spacing, raster_resolution)
 
     features = []
     count = 0
@@ -1951,8 +2016,6 @@ def machinelearningOutputGridResults(raster_resolution, df_original, df_predicte
 
     with open(output_ml_geojson, "w", encoding='UTF-8') as writerfileobj:
         json.dump(featurecollection, writerfileobj, ensure_ascii=False, indent=4)
-
-    createRasterFromGeoJSON(raster_resolution, output_ml_geojson, output_ml_geotiff)
 
 
 # ***********************************************************
@@ -2013,7 +2076,7 @@ def osmDownloadData():
 
     if (not isfile(OSM_EXPORT_DATA + '.gpkg')) or (not isfile(yaml_all_filename)):
 
-        LogMessage("Missing " + OSM_EXPORT_DATA + ".gpkg, running osm-export-tool to generate it using: " + yaml_all_filename)
+        LogMessage("Missing " + basename(OSM_EXPORT_DATA) + ".gpkg, running osm-export-tool to generate it using: " + yaml_all_filename)
 
         yaml_files = getFilesInFolder(OSM_CONFIG_FOLDER)
         for yaml_file in yaml_files:
@@ -2595,7 +2658,7 @@ def getRejectedBeforeDateWithinDistance(radiuspoints, date):
 
     return len(radiuspoints)
 
-def initialiseAllLargeWindProjectsDataFrame():
+def initialiseAllLargeWindProjectsDataFrame(boundingbox=None):
     """
     Initialises turbine data frame with all large turbine positions
     """
@@ -2603,44 +2666,64 @@ def initialiseAllLargeWindProjectsDataFrame():
     global ALLTURBINES_DF, WINDTURBINES_MIN_HEIGHTTIP
 
     if ALLTURBINES_DF is None:
-        LogMessage("Loading all large turbine positions into dataframe...")
-        ALLTURBINES_DF = pd.DataFrame(postgisGetResultsAsDict(\
-            "SELECT ST_X(geom_27700) x, ST_Y(geom_27700) y, * FROM windturbines_all_projects__uk WHERE turbine_tipheight >= " + str(WINDTURBINES_MIN_HEIGHTTIP) + ";"))
-        LogMessage("All large turbine positions loaded into dataframe")
+        if boundingbox is None:
+            LogMessage("Loading all large turbine positions into dataframe...")
+            ALLTURBINES_DF = pd.DataFrame(postgisGetResultsAsDict(\
+                "SELECT ST_X(geom_27700) x, ST_Y(geom_27700) y, * FROM windturbines_all_projects__uk WHERE turbine_tipheight >= " + str(WINDTURBINES_MIN_HEIGHTTIP) + ";"))
+        else:
+            boundingbox_str = ",".join([str(boundingbox['left']), str(boundingbox['bottom']), str(boundingbox['right']), str(boundingbox['top'])])
+            LogMessage("Loading all large turbine positions within bounding box [" + boundingbox_str + "] into dataframe...")
+            ALLTURBINES_DF = pd.DataFrame(postgisGetResultsAsDict(\
+                "SELECT ST_X(geom_27700) x, ST_Y(geom_27700) y, * FROM windturbines_all_projects__uk WHERE turbine_tipheight >= " + \
+                    str(WINDTURBINES_MIN_HEIGHTTIP) + " AND (geom_27700 @ ST_MakeEnvelope(%s, %s, %s, %s, 27700));", \
+                (AsIs(boundingbox['left']), AsIs(boundingbox['bottom']), AsIs(boundingbox['right']), AsIs(boundingbox['top']), )))
+        LogMessage("All large turbine positions loaded into dataframe, size: " + str(len(ALLTURBINES_DF)))
 
-def runRadiusSearch(searchposition, distance, REPD):
+def runRadiusSearch(searchposition, distance, REPD, boundingbox=None):
     """
     Runs radius search on all turbines within 'distance' of 'searchposition'
     """
 
-    initialiseAllLargeWindProjectsDataFrame()
+    global ALLTURBINES_DF, ALLTURBINES_GDF
 
-    if REPD is None: df_otherprojects = ALLTURBINES_DF
-    else: df_otherprojects = ALLTURBINES_DF.loc[ALLTURBINES_DF['project_guid'] != REPD]
+    initialiseAllLargeWindProjectsDataFrame(boundingbox)
 
-    gdf = gpd.GeoDataFrame(
-        df_otherprojects,
+    if (ALLTURBINES_GDF is None) or (REPD is not None):
+        if REPD is None: df_otherprojects = ALLTURBINES_DF
+        else: df_otherprojects = ALLTURBINES_DF.loc[ALLTURBINES_DF['project_guid'] != REPD]
+
+        ALLTURBINES_GDF = gpd.GeoDataFrame(
+            df_otherprojects,
+            geometry=gpd.points_from_xy(
+                df_otherprojects["x"],
+                df_otherprojects["y"],
+            ),
+            crs="EPSG:27700",
+        )
+
+    poi_df = pd.DataFrame([searchposition])
+    poi_gdf = gpd.GeoDataFrame(
+        poi_df,
         geometry=gpd.points_from_xy(
-            df_otherprojects["x"],
-            df_otherprojects["y"],
+            poi_df['x'],
+            poi_df['y'],
         ),
         crs="EPSG:27700",
     )
 
-    filtered_df = pd.DataFrame([searchposition])
-    filtered_gdf = gpd.GeoDataFrame(
-        filtered_df,
-        geometry=gpd.points_from_xy(
-            filtered_df['x'],
-            filtered_df['y'],
-        ),
-        crs="EPSG:27700",
-    )
+    # x = poi_gdf.buffer(distance).union_all()
+    # neighbours = ALLTURBINES_GDF["geometry"].intersection(x)
+    # neighbours = ALLTURBINES_GDF[~neighbours.is_empty]
 
-    x = filtered_gdf.buffer(distance).union_all()
-    neighbours = gdf["geometry"].intersection(x)
+    xmin, ymin, xmax, ymax = (searchposition['x'] - distance), (searchposition['y'] - distance), (searchposition['x'] + distance), (searchposition['y'] + distance) 
+    allturbines_bounded = ALLTURBINES_GDF.cx[xmin:xmax, ymin:ymax]
+    if len(allturbines_bounded) == 0: return None
 
-    return gdf[~neighbours.is_empty]
+    # neighbours = ALLTURBINES_GDF.sjoin_nearest(poi_gdf, max_distance=distance)
+    neighbours = allturbines_bounded.sjoin_nearest(poi_gdf, max_distance=distance)
+    neighbours = neighbours[neighbours.index != poi_gdf.index[0]]
+
+    return neighbours
 
 def getOperationalBeforeDateWithinDistanceLegacy(date, position, distance):
     """
@@ -3438,14 +3521,16 @@ def createDistanceCache(tables):
         LogMessage("************************************************")
 
 
-def createBatchGrid(batch_grid_spacing):
+def createBatchGrid(runtest, batch_grid_spacing):
     """
     Creates batch grid for multiprocessing
     """
 
+    global TEST_POINT
+
     if batch_grid_spacing is None: return None
 
-    batch_grid_table = buildBatchGridTableName(batch_grid_spacing)
+    batch_grid_table = buildBatchGridTableName(runtest, batch_grid_spacing)
 
     if not postgisCheckTableExists(batch_grid_table):
 
@@ -3456,9 +3541,14 @@ def createBatchGrid(batch_grid_spacing):
         postgisExec("ALTER TABLE %s ADD COLUMN temp_id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY", (AsIs(batch_grid_table), ))
         postgisExec("DELETE FROM %s WHERE temp_id IN (SELECT grid.temp_id FROM %s grid, overall_clipping__union clipping WHERE ST_Intersects(ST_Transform(grid.geom, 4326), clipping.geom) IS FALSE);", \
                     (AsIs(batch_grid_table), AsIs(batch_grid_table), ))
+        postgisExec("CREATE INDEX %s ON %s USING GIST (geom);", (AsIs(batch_grid_table + "_idx"), AsIs(batch_grid_table), ))
+
+        # If running test, only select batch grid square that covers TEST_POINT
+        if runtest:
+            postgisExec("DELETE FROM %s WHERE ST_Intersects(geom, ST_Transform(ST_SetSRID(ST_MakePoint(%s, %s), 4326), 27700)) = FALSE", (AsIs(batch_grid_table), TEST_POINT['lng'], TEST_POINT['lat'], ))
+
         postgisExec("ALTER TABLE %s DROP COLUMN temp_id", (AsIs(batch_grid_table), ))
         postgisExec("ALTER TABLE %s ADD COLUMN id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY", (AsIs(batch_grid_table), ))
-        postgisExec("CREATE INDEX %s ON %s USING GIST (geom);", (AsIs(batch_grid_table + "_idx"), AsIs(batch_grid_table), ))
 
     number_batches = postgisGetResults("SELECT COUNT(*) FROM %s;", (AsIs(batch_grid_table), ))
     number_batches = number_batches[0][0]
@@ -3467,7 +3557,7 @@ def createBatchGrid(batch_grid_spacing):
 
     return number_batches
 
-def createSamplingGrid(batch_index, batch_grid_spacing, raster_resolution):
+def createSamplingGrid(runtest, batch_index, batch_grid_spacing, raster_resolution):
     """
     Creates sampling grid for use in building final result maps
     """
@@ -3477,7 +3567,7 @@ def createSamplingGrid(batch_index, batch_grid_spacing, raster_resolution):
     if (batch_index is not None) and (batch_grid_spacing is not None):
 
         batch_sampling_grid = buildBatchSamplingGridTableName(batch_index, batch_grid_spacing)
-        batch_grid_table = buildBatchGridTableName(batch_grid_spacing)
+        batch_grid_table = buildBatchGridTableName(runtest, batch_grid_spacing)
         batch_cell_table = buildBatchCellTableName(batch_index, batch_grid_spacing)
         number_batches = postgisGetResults("SELECT COUNT(*) FROM %s;", (AsIs(batch_grid_table), ))
         number_batches = number_batches[0][0]
@@ -3680,64 +3770,15 @@ def getSampleGrid(batch_index, batch_grid_spacing):
         batch_sampling_grid_cell = buildBatchSamplingGridTableName(batch_index, batch_grid_spacing)
         return postgisGetResultsAsDict("SELECT easting, northing, ST_X(geom) lng, ST_Y(geom) lat FROM %s ORDER BY easting, northing;", (AsIs(batch_sampling_grid_cell), ))
 
-def createTestSamplingGrid(raster_resolution, position):
-    """
-    Creates test sampling grid of size TEST_SAMPLING_GRID_SIZE metres that contains position
-    """
-
-    global TEST_SAMPLING_GRID_SIZE, OVERALL_CLIPPING_FILE, SAMPLING_GRID
-
-    test_sampling_grid_gridsquare_table = 'sitepredictor__test_sampling_grid__gridsquare'
-    test_sampling_grid_gridsquare_union_table = 'sitepredictor__test_sampling_grid__gridsquare__union'
-    clipping_table = reformatTableName(OVERALL_CLIPPING_FILE)
-    clipping_union_table = buildUnionTableName(clipping_table)
-
-    postgisExec("DROP TABLE %s;", (AsIs(test_sampling_grid_gridsquare_table), ))
-    postgisExec("DROP TABLE %s;", (AsIs(test_sampling_grid_gridsquare_union_table), ))
-    postgisExec("DROP TABLE %s;", (AsIs(SAMPLING_GRID), ))
-
-    LogMessage("Creating test sampling grid with size " + str(TEST_SAMPLING_GRID_SIZE) + " metres")
-
-    postgisExec("CREATE TABLE %s AS SELECT ST_Transform((ST_SquareGrid(%s, ST_Transform(geom, 27700))).geom, 4326) geom FROM %s;",\
-                (AsIs(test_sampling_grid_gridsquare_table), AsIs(TEST_SAMPLING_GRID_SIZE), AsIs(clipping_union_table), ))
-
-    LogMessage("Removing any grid squares not containing point [" + str(position['lng']) + "," + str(position['lat']) + "]")
-
-    postgisExec("DELETE FROM %s WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) = FALSE", (AsIs(test_sampling_grid_gridsquare_table), position['lng'], position['lat'], ))
-
-    LogMessage("Dissolving remaining grid squares in test sampling grid")
-
-    postgisExec("CREATE TABLE %s AS SELECT ST_Union(geom) geom FROM %s", (AsIs(test_sampling_grid_gridsquare_union_table), AsIs(test_sampling_grid_gridsquare_table), ))
-
-    LogMessage("Filling test sampling grid with points spaced at " + str(raster_resolution) + " metres")
-
-    # Note: It's important raster_resolution is float when sent to ST_AsRaster
-    # otherwise interpreted as number of rows/columns rather than size of rows/columns
-
-    postgisExec("""
-    CREATE TABLE %s AS
-    (
-        SELECT 
-            ST_X(ST_Transform(samplepoints.samplepoint, 27700)) easting,
-            ST_Y(ST_Transform(samplepoints.samplepoint, 27700)) northing,
-            samplepoints.samplepoint geom
-        FROM
-        (
-            SELECT ST_Transform((ST_PixelAsCentroids(ST_AsRaster(ST_Transform(geom, 27700), %s, %s))).geom, 4326) samplepoint FROM %s
-        ) samplepoints 
-    );
-    """, (AsIs(SAMPLING_GRID), AsIs(float(raster_resolution)), AsIs(float(raster_resolution)), AsIs(test_sampling_grid_gridsquare_union_table), ))
-    postgisExec("ALTER TABLE %s ADD COLUMN id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY;", (AsIs(SAMPLING_GRID), ))
-
 def getSamplingGridBatchNumberPoints(batch_parameters):
     """
     Get total number of points for single batch grid square
     """
 
-    batch_index, batch_grid_spacing, raster_resolution = batch_parameters[0], batch_parameters[1], batch_parameters[2]
+    runtest, batch_index, batch_grid_spacing, raster_resolution = batch_parameters[0], batch_parameters[1], batch_parameters[2], batch_parameters[3]
     batch_cell_table = buildBatchCellTableName(batch_index, batch_grid_spacing)
     batch_sampling_grid_table = buildBatchSamplingGridTableName(batch_index, batch_grid_spacing)
-    createSamplingGrid(batch_index, batch_grid_spacing, raster_resolution)
+    createSamplingGrid(runtest, batch_index, batch_grid_spacing, raster_resolution)
     if postgisCheckTableExists(batch_sampling_grid_table): 
         points_in_batch = postgisGetResults("SELECT COUNT(*) FROM %s;", (AsIs(batch_sampling_grid_table), ))
         points_in_batch = points_in_batch[0][0]
@@ -3745,14 +3786,12 @@ def getSamplingGridBatchNumberPoints(batch_parameters):
         postgisDropTable(batch_sampling_grid_table)
     if postgisCheckTableExists(batch_cell_table): postgisDropTable(batch_cell_table)
 
-def getSamplingGridNumberPoints(batch_grid_spacing, batch_number, raster_resolution):
+def getSamplingGridNumberPoints(runtest, batch_grid_spacing, batch_number, raster_resolution):
     """
     Get total number of points by adding points within each batch grid square
     """
 
-    number_points = 0
-
-    multiprocessing_batch_values = [[batch_index, batch_grid_spacing, raster_resolution] for batch_index in range(1, (batch_number + 1))]
+    multiprocessing_batch_values = [[runtest, batch_index, batch_grid_spacing, raster_resolution] for batch_index in range(1, (batch_number + 1))]
 
     cnt = Value('i', 0)
     # Run multiprocessing pool
@@ -3770,7 +3809,7 @@ def createSamplingGridData(batch_values):
 
     batch_index, batch_grid_spacing, raster_resolution = None, None, None
     if (batch_values is not None):
-        batch_index, batch_grid_spacing, raster_resolution = batch_values[0], batch_values[1], batch_values[2]
+        runtest, batch_index, batch_grid_spacing, raster_resolution = batch_values[0], batch_values[1], batch_values[2], batch_values[3]
 
     LogMessage("========================================")
     LogMessage("Starting batch: " + str(batch_index))
@@ -3779,18 +3818,11 @@ def createSamplingGridData(batch_values):
     # ************************************************************
     # ******************* CREATE SAMPLING GRID *******************
     # ************************************************************
-    #
-    # Use below to test on single small grid square covering specific point
-    # ------------------------------------------------------------
-    # point = {'lng': 0, 'lat': 51}
-    # createTestSamplingGrid(raster_resolution, point)
-    # ------------------------------------------------------------
-    #
     # Default, below, is to create sampling grid for whole of UK
     # If batch_index/batch_grid_spacing are set:
     # - Cut up UK into grid squares spaced at batch_grid_spacing metres
     # - Select grid square with index 'batch_index'
-    createSamplingGrid(batch_index, batch_grid_spacing, raster_resolution)
+    createSamplingGrid(runtest, batch_index, batch_grid_spacing, raster_resolution)
 
 
     # ************************************************************
@@ -3824,8 +3856,15 @@ def createSamplingGridData(batch_values):
 
     index, features = 0, []
     distance_ranges = [10, 20, 30, 40]
-    output_data = buildBatchGridOutputData(buildOutputPath(OUTPUT_DATA_SAMPLEGRID, raster_resolution), batch_index, batch_grid_spacing)
-
+    max_distance_range = 1000 * max(distance_ranges)
+    batch_sampling_grid_cell = buildBatchSamplingGridTableName(batch_index, batch_grid_spacing)
+    boundingbox = postgisGetTableBounds(batch_sampling_grid_cell)
+    boundingbox['left']    -= max_distance_range
+    boundingbox['right']   += max_distance_range
+    boundingbox['bottom']  -= max_distance_range
+    boundingbox['top']     += max_distance_range
+    output_data = buildBatchGridOutputData(buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, raster_resolution), batch_index, batch_grid_spacing)
+    
     distances = []
     for index in range(len(sample_grid)): distances.append({})
 
@@ -3862,12 +3901,14 @@ def createSamplingGridData(batch_values):
     with total.get_lock(): total_points = total.value
 
     added_to_count = 0
+    timings = {'step1': 0, "step2": 0, "step3": 0, "step4": 0, "step5": 0, "step6": 0, "step7": 0}
     for index in range(len(sample_grid)):
         turbine = {}
 
         if index % 1000 == 0:
             with cnt.get_lock():
                 LogMessage("Processing hypothetical turbine position: " + str(cnt.value) + "/" + str(total_points))
+                # print(json.dumps(timings, indent=4))
                 cnt.value += (index - added_to_count)
                 added_to_count = index
 
@@ -3881,16 +3922,20 @@ def createSamplingGridData(batch_values):
 
         LogStage("Step 1")
 
+        # time_start = time.time()
         turbine_lnglat = {'lng': sample_grid[index]['lng'], 'lat': sample_grid[index]['lat']}
         turbine_xy = {'x': sample_grid[index]['easting'], 'y': sample_grid[index]['northing']}
         turbine['turbine_country'] = getCountry(turbine_lnglat)
+        # timings['step1'] += (time.time() - time_start)
         if turbine['turbine_country'] is None: 
             LogMissingData("No country found for position: " + str(turbine_lnglat['lng']) + "," + str(turbine_lnglat['lat']))
             continue
 
         LogStage("Step 2")
 
+        # time_start = time.time()
         turbine['turbine_elevation'] = getElevation(turbine_lnglat)[0]
+        # timings['step2'] += (time.time() - time_start)
 
         LogStage("Step 3")
 
@@ -3899,12 +3944,16 @@ def createSamplingGridData(batch_values):
         turbine['turbine_grid_coordinates_northing'] = sample_grid[index]['northing']
         turbine['turbine_lnglat_lng'] = turbine_lnglat['lng']
         turbine['turbine_lnglat_lat'] = turbine_lnglat['lat']
+        # time_start = time.time()
         turbine['windspeed'] = getWindSpeed(turbine_lnglat)
+        # timings['step3'] += (time.time() - time_start)
         turbine['project_size'] = 1
 
         LogStage("Step 4")
 
+        # time_start = time.time()
         census = getCensus(turbine_lnglat)
+        # timings['step4'] += (time.time() - time_start)
         if census is None:
             LogMissingData("No census data for position: " + str(turbine_lnglat['lng']) + "," + str(turbine_lnglat['lat']))
             continue
@@ -3928,7 +3977,9 @@ def createSamplingGridData(batch_values):
         }
 
         year = str(int(datetime.today().strftime('%Y')) - 1)
+        # time_start = time.time()
         political = getPolitical(turbine_lnglat, year)
+        # timings['step5'] += (time.time() - time_start)
 
         if political is None:
             LogMissingData("No political data for point: " + str(turbine_lnglat['lng']) + "," + str(turbine_lnglat['lat']) + " so skipping")
@@ -3938,18 +3989,27 @@ def createSamplingGridData(batch_values):
 
         for political_key in political.keys(): turbine[political_key] = political[political_key]
 
+        # time_start = time.time()
         for distance_range in distance_ranges:
-            radiuspoints                                                        = runRadiusSearch(turbine_xy, 1000 * distance_range, None)
-            turbine['count__operational_within_' + str(distance_range)+'km']    = getOperationalBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
-            turbine['count__approved_within_' + str(distance_range)+'km']       = getApprovedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
-            turbine['count__applied_within_' + str(distance_range)+'km']        = getAppliedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
-            turbine['count__rejected_within_' + str(distance_range)+'km']       = getRejectedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
+            radiuspoints = runRadiusSearch(turbine_xy, 1000 * distance_range, None, boundingbox)
+            if radiuspoints is None:
+                turbine['count__operational_within_' + str(distance_range)+'km']    = 0
+                turbine['count__approved_within_' + str(distance_range)+'km']       = 0
+                turbine['count__applied_within_' + str(distance_range)+'km']        = 0
+                turbine['count__rejected_within_' + str(distance_range)+'km']       = 0
+            else:
+                turbine['count__operational_within_' + str(distance_range)+'km']    = getOperationalBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
+                turbine['count__approved_within_' + str(distance_range)+'km']       = getApprovedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
+                turbine['count__applied_within_' + str(distance_range)+'km']        = getAppliedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
+                turbine['count__rejected_within_' + str(distance_range)+'km']       = getRejectedBeforeDateWithinDistance(radiuspoints, turbine['project_date_end'])
+        # timings['step6'] += (time.time() - time_start)
 
         LogStage("Step 7")
 
         if batch_index is None:
             for distance_key in distances[index].keys(): turbine[distance_key] = distances[index][distance_key]
 
+        # time_start = time.time()
         if not firstrowwritten:
             with open(output_data, 'w', newline='') as csvfile:
                 fieldnames = turbine.keys()
@@ -3960,6 +4020,7 @@ def createSamplingGridData(batch_values):
         with open(output_data, 'a', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writerow(turbine)
+        # timings['step7'] += (time.time() - time_start)
 
         index += 1
 
@@ -4226,7 +4287,7 @@ def initializeDistanceRasters(raster_resolution, batch_grid_spacing):
 
     createDistanceRasters(raster_resolution, tables_to_test, None, batch_grid_spacing)
 
-def runSitePredictor(batch_grid_spacing, raster_resolution):
+def runSitePredictor(runtest, batch_grid_spacing, raster_resolution, pass_index):
     """
     Runs entire site predictor application
     """
@@ -4244,28 +4305,30 @@ def runSitePredictor(batch_grid_spacing, raster_resolution):
     createAllTurbinesData()
 
     # Build machine learning model using failed/successful wind turbine features
-    if not machinelearningModelExists(): machinelearningBuildModel()
+    if not machinelearningModelExists(): machinelearningBuildModel(pass_index)
 
     # Create batch grid for multiprocessing
     if batch_grid_spacing is None: batch_grid_spacing = DEFAULT_BATCH_GRID_SPACING
 
-    output_data = buildOutputPath(OUTPUT_DATA_SAMPLEGRID, raster_resolution)
-
+    output_data = buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, raster_resolution)
+    
     if not isfile(output_data):
 
-        number_batches = createBatchGrid(batch_grid_spacing)
+        number_batches = createBatchGrid(runtest, batch_grid_spacing)
+
         LogMessage("Batch grid spacing set to " + str(batch_grid_spacing) + " metres, will run multiprocessing with " + str(number_batches) + " batches")
+        if runtest: LogMessage("NOTE: Using test grid - so only 1 batch")
 
         LogMessage("Determining total number of points to be processed...")
 
-        total_points = getSamplingGridNumberPoints(batch_grid_spacing, number_batches, raster_resolution)
+        total_points = getSamplingGridNumberPoints(runtest, batch_grid_spacing, number_batches, raster_resolution)
 
         LogMessage("Total number of points to be processed: " + str(total_points))
 
         # Initialize core distance rasters that will be used by all batches
         initializeDistanceRasters(raster_resolution, batch_grid_spacing)
 
-        multiprocessing_batch_values = [[batch_index, batch_grid_spacing, raster_resolution] for batch_index in range(1, number_batches + 1)]
+        multiprocessing_batch_values = [[runtest, batch_index, batch_grid_spacing, raster_resolution] for batch_index in range(1, number_batches + 1)]
 
         LogMessage("************************************************")
         LogMessage("********** STARTING MULTIPROCESSING ************")
@@ -4277,7 +4340,7 @@ def runSitePredictor(batch_grid_spacing, raster_resolution):
             # Populates sampling grid (spaced at raster_resolution metres) with same
             # features data - where possible - as all turbines, above.
             # Year used is (CURRENTYEAR - 1), ie. attempting to predict probability-of-success for now
-            p.map(createSamplingGridData, multiprocessing_batch_values)
+            p.map(createSamplingGridData, multiprocessing_batch_values, chunksize=1)
 
         LogMessage("************************************************")
         LogMessage("*********** ENDING MULTIPROCESSING *************")
@@ -4288,8 +4351,8 @@ def runSitePredictor(batch_grid_spacing, raster_resolution):
         firstrowwritten = False
 
         for batch_item in multiprocessing_batch_values:
-            batch_index, batch_grid_spacing = batch_item[0], batch_item[1]
-            batch_output_data = buildBatchGridOutputData(buildOutputPath(OUTPUT_DATA_SAMPLEGRID, raster_resolution), batch_index, batch_grid_spacing)
+            runtest, batch_index, batch_grid_spacing = batch_item[0], batch_item[1], batch_item[2]
+            batch_output_data = buildBatchGridOutputData(buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, raster_resolution), batch_index, batch_grid_spacing)
             if not isfile(batch_output_data): continue
 
             LogMessage("Adding batch output file: " + str(batch_index))
@@ -4316,13 +4379,97 @@ def runSitePredictor(batch_grid_spacing, raster_resolution):
 
             os.remove(batch_output_data)
 
-    final_raster_path = buildOutputPath(OUTPUT_ML_RASTER, raster_resolution)
+    final_raster_path = buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, raster_resolution)
 
     if not isfile(final_raster_path):
         # Run machine learning model on sampling grid
-        machinelearningRunModelOnSamplingGrid(raster_resolution)
+        machinelearningRunModelOnSamplingGrid(runtest, batch_grid_spacing, raster_resolution)
 
     if isdir(CLIPPING_FOLDER): shutil.rmtree(CLIPPING_FOLDER)
+
+def clearML(runtest, batch_grid_spacing, final_raster_resolution):
+    """
+    Clears previous ML run
+    """
+
+    global OUTPUT_ML_GEOJSON, OUTPUT_ML_RASTER, OUTPUT_ML_CSV
+
+    # Delete ML model and any files derived from applying it
+    machinelearningDeleteSavedModels()
+    files_to_delete =   [ \
+                            buildOutputPath(runtest, OUTPUT_ML_GEOJSON, batch_grid_spacing, final_raster_resolution), \
+                            buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, final_raster_resolution), \
+                            buildOutputPath(runtest, OUTPUT_ML_CSV, batch_grid_spacing, final_raster_resolution) \
+                        ]
+
+    for file_to_delete in files_to_delete:
+        if isfile(file_to_delete): os.remove(file_to_delete)
+
+def generatePercentileVariabilityGeoTIFF(file_paths, output_file_path):
+    """
+    Generates a GeoTIFF showing (P95 - P5) per pixel across a stack of input GeoTIFFs.
+    This percentile range reflects predictive variability or uncertainty.
+    """
+
+    stack = []
+    for path in file_paths:
+        with rasterio.open(path) as src:
+            band = src.read(1).astype(np.float32)
+            stack.append(band)
+            profile = src.profile  # Used to write the output
+
+    raster_stack = np.stack(stack)  # shape: (n_runs, height, width)
+
+    # Compute percentiles along the 0th axis (runs)
+    p95 = np.nanpercentile(raster_stack, 95, axis=0)
+    p5 = np.nanpercentile(raster_stack, 5, axis=0)
+
+    percentile_range = p95 - p5
+
+    # Optional: set a no-data value
+    NODATA_VALUE = -9999
+    percentile_range[np.isnan(percentile_range)] = NODATA_VALUE
+
+    # Update raster profile
+    profile.update(dtype=rasterio.float32, count=1, nodata=NODATA_VALUE)
+
+    with rasterio.open(output_file_path, 'w', **profile) as dst:
+        dst.write(percentile_range.astype(np.float32), 1)
+
+    LogMessage("Saved percentile range GeoTIFF: " + output_file_path)
+
+
+def generateNormalizedSDGeoTIFF(file_paths, output_file_path):
+    """
+    Generates a GeoTIFF with a normalized SD for all GeoTIFFs
+    Normalized SD => 1 = normal distribution, values essentially random, no-data > 1
+    As value -> 0, less random
+    """
+
+    stack = []
+    for path in file_paths:
+        with rasterio.open(path) as src:
+            band = src.read(1).astype(np.float32)
+            stack.append(band)
+            profile = src.profile  # We'll use this for writing output
+
+    raster_stack = np.stack(stack)  # Shape: (n_passes, height, width)
+
+    # 3. Compute stddev along the passes axis
+    stddev = np.nanstd(raster_stack, axis=0)
+
+    # 4. Normalize and apply nodata
+    normalized = stddev / MAX_RANDOM_STDDEV
+    normalized[normalized > 1.0] = NODATA_VALUE
+
+    # 5. Update profile for single-band float GeoTIFF
+    profile.update(dtype=rasterio.float32, count=1, nodata=NODATA_VALUE)
+
+    # 6. Write output GeoTIFF
+    with rasterio.open(output_file_path, 'w', **profile) as dst:
+        dst.write(normalized.astype(np.float32), 1)
+
+    LogMessage("Saved normalized SD GeoTIFF: " + output_file_path)
 
 # ***********************************************************
 # ***********************************************************
@@ -4335,13 +4482,13 @@ def main():
     Main function - put here to allow multiprocessing to work
     """
 
-    global RASTER_RESOLUTION, SAMPLING_GRID, LOG_SINGLE_PASS, RASTER_OUTPUT_FOLDER
+    global RASTER_RESOLUTION, SAMPLING_GRID, LOG_SINGLE_PASS, RASTER_OUTPUT_FOLDER, WORKING_FOLDER
 
     final_raster_resolution = RASTER_RESOLUTION
     batch_grid_spacing = None
 
     if len(sys.argv) > 1:
-        batch_grid_spacing_set, resample, rerunml = False, False, False
+        batch_grid_spacing_set, resample, rerunml, runtest, passes = False, False, False, False, None
 
         arg_index = 1
         while True:
@@ -4361,6 +4508,10 @@ def main():
                 rerunml = True
                 LogMessage("--rerunml argument passed: Deleting ML model and related output files")
 
+            if arg == '--test':
+                runtest = True
+                LogMessage("--test argument passed: Only sample specific test area")
+
             if arg == '--resolution':
                 if len(sys.argv) > arg_index:
                     resolution = sys.argv[arg_index + 1]
@@ -4368,6 +4519,14 @@ def main():
                         final_raster_resolution = int(resolution)
                         arg_index += 1
                         LogMessage("--resolution argument passed: Using resolution of " + resolution + " metres")
+
+            if arg == '--passes':
+                if len(sys.argv) > arg_index:
+                    passes = sys.argv[arg_index + 1]
+                    if isfloat(passes):
+                        passes = int(passes)
+                        arg_index += 1
+                        LogMessage("--passes argument passed: Number of passes to run: " + str(passes))
 
             arg_index += 1
 
@@ -4377,20 +4536,13 @@ def main():
             # Delete RASTER_OUTPUT_FOLDER just to be safe
             shutil.rmtree(RASTER_OUTPUT_FOLDER)
             files_to_delete =   [ \
-                                    buildOutputPath(OUTPUT_DATA_SAMPLEGRID, final_raster_resolution), \
-                                    buildOutputPath(OUTPUT_ML_GEOJSON, final_raster_resolution), \
-                                    buildOutputPath(OUTPUT_ML_RASTER, final_raster_resolution), \
-                                    buildOutputPath(OUTPUT_ML_CSV, final_raster_resolution) \
+                                    buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, final_raster_resolution), \
+                                    buildOutputPath(runtest, OUTPUT_ML_GEOJSON, batch_grid_spacing, final_raster_resolution), \
+                                    buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, final_raster_resolution), \
+                                    buildOutputPath(runtest, OUTPUT_ML_CSV, batch_grid_spacing, final_raster_resolution) \
                                 ]
 
-        if rerunml:
-            # Delete ML model and any files derived from applying it
-            machinelearningDeleteSavedModels()
-            files_to_delete =   [ \
-                                    buildOutputPath(OUTPUT_ML_GEOJSON, final_raster_resolution), \
-                                    buildOutputPath(OUTPUT_ML_RASTER, final_raster_resolution), \
-                                    buildOutputPath(OUTPUT_ML_CSV, final_raster_resolution) \
-                                ]
+        if rerunml: clearML(runtest, batch_grid_spacing, final_raster_resolution)
 
         if files_to_delete is not None:
             for file_to_delete in files_to_delete:
@@ -4399,14 +4551,32 @@ def main():
 
     SAMPLING_GRID += str(final_raster_resolution) + "_m__uk"
 
-    runSitePredictor(batch_grid_spacing, final_raster_resolution)
+    if passes is None:
+        runSitePredictor(runtest, batch_grid_spacing, final_raster_resolution, 666)
+    else:
+        makeFolder(PASSES_FOLDER)
+        file_paths = []
+        for pass_index in range(1, passes + 1):
+            LogMessage("Running pass: " + str(pass_index))
+            clearML(runtest, batch_grid_spacing, final_raster_resolution)
+            output_tif_pass = PASSES_FOLDER + 'pass-' + str(pass_index).zfill(5) + '-' + basename(OUTPUT_ML_RASTER)
+            file_paths.append(output_tif_pass)
+            if not isfile(output_tif_pass):
+                runSitePredictor(runtest, batch_grid_spacing, final_raster_resolution, pass_index)
+                shutil.copy(buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, final_raster_resolution), output_tif_pass)
+
+        normalized_sd_geotiff = PASSES_FOLDER + 'normalized-sd-' + basename(OUTPUT_ML_RASTER)
+        # generateNormalizedSDGeoTIFF(file_paths, normalized_sd_geotiff)
+        percentile_variability_geotiff = PASSES_FOLDER + 'percentile-variability-' + basename(OUTPUT_ML_RASTER)
+        generatePercentileVariabilityGeoTIFF(file_paths, percentile_variability_geotiff)
 
     # Copy final results as gzipped tar to /usr/src/openwindenergy/ folder
-    if isfile(buildOutputPath(OUTPUT_ML_RASTER, final_raster_resolution)):
-        data_samplegrid = basename(buildOutputPath(OUTPUT_DATA_SAMPLEGRID, final_raster_resolution))
-        ml_geojson = basename(buildOutputPath(OUTPUT_ML_GEOJSON, final_raster_resolution))
-        ml_raster = basename(buildOutputPath(OUTPUT_ML_RASTER, final_raster_resolution))
-        ml_csv = basename(buildOutputPath(OUTPUT_ML_CSV, final_raster_resolution))
+    if WORKING_FOLDER.startswith('/usr/src/openwindenergy/') and isfile(buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, final_raster_resolution)):
+        LogMessage("Bundling final rasters and data as tar.gz archives")
+        data_samplegrid = basename(buildOutputPath(runtest, OUTPUT_DATA_SAMPLEGRID, batch_grid_spacing, final_raster_resolution))
+        ml_geojson = basename(buildOutputPath(runtest, OUTPUT_ML_GEOJSON, batch_grid_spacing, final_raster_resolution))
+        ml_raster = basename(buildOutputPath(runtest, OUTPUT_ML_RASTER, batch_grid_spacing, final_raster_resolution))
+        ml_csv = basename(buildOutputPath(runtest, OUTPUT_ML_CSV, batch_grid_spacing, final_raster_resolution))
         subprocess.call("tar -cjf /usr/src/openwindenergy/build-cli/output/sitepredictor__finalraster_data__" + str(final_raster_resolution) + "_m.tar.gz -C /usr/src/openwindenergy/sitepredictor/output/ " + data_samplegrid + " " + ml_geojson + " " + ml_raster + " " + ml_csv, shell=True)
         subprocess.call("tar -cvzf /usr/src/openwindenergy/build-cli/output/sitepredictor__intermediate_rasters__" + str(final_raster_resolution) + "_m.tar.gz /usr/src/openwindenergy/sitepredictor/rasters/distance__" + str(final_raster_resolution) + "*.tif", shell=True)
 

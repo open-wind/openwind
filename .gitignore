@@ -46,6 +46,8 @@ terraform/azure/
 sitepredictor/*.csv
 sitepredictor/*.log
 sitepredictor/machinelearning_legacy/
+sitepredictor/passes/
+sitepredictor/deprecated.zip
 sitepredictor/census_2011.zip
 sitepredictor/output/
 sitepredictor/sentimentanalysis/

@@ -49,6 +49,7 @@ import geopandas as gpd
 import pandas as pd
 import shapefile
 import multiprocessing
+from psycopg2 import errors as postgiserrors
 from multiprocessing import Pool, Value
 from datetime import datetime
 from requests import Request
@@ -206,6 +207,14 @@ def initLogging():
         format='%(asctime)s [%(process_padded)s] [%(levelname)-2s] %(message)s',
         handlers=[handler_1, handler_2, handler_3]
     )
+
+def getQueueKey(priority, index):
+    """
+    Generates dict key from priority and queue index
+    """
+
+    # Use float to ensure largest number first; add '9' to prevent loss of '0' in 10, 20...
+    return float(str(priority) + "." + str(index) + '9')
 
 def getNumberProcesses():
     """
@@ -886,6 +895,30 @@ def postgisDropAmalgamatedTables():
         table_name, = table
         postgisDropTable(table_name)
 
+def postgisDumpGeometriesInBatches(input_table, output_table, batch_size=500):
+    """
+    Dumps multi-geometries into single geometries in batches to avoid memory issues.
+    Creates a new table with individual geometries.
+    """
+
+    if postgisCheckTableExists(output_table): postgisDropTable(output_table)
+
+    postgisExec("CREATE TABLE %s (id SERIAL PRIMARY KEY, geom geometry);", (AsIs(output_table), ))
+
+    results = postgisGetResults("SELECT id FROM %s;", (AsIs(input_table), ))
+    all_ids = [row[0] for row in results]
+
+    LogMessage(f"postgisDumpGeometriesInBatches: Processing {len(all_ids)} features...")
+
+    # Process in batches
+    for i in range(0, len(all_ids), batch_size):
+        batch_ids = all_ids[i:i + batch_size]
+        LogMessage(f"postgisDumpGeometriesInBatches: [Batch {i // batch_size + 1}] Dumping {len(batch_ids)} features...")
+
+        postgisExec(f"INSERT INTO %s(geom) SELECT (ST_Dump(geom)).geom FROM %s WHERE id = ANY(%s) AND ST_IsValid(geom)", (AsIs(output_table), AsIs(input_table), batch_ids,))
+
+    LogMessage("postgisDumpGeometriesInBatches: Done.")
+
 def singleprocessAmalgamateAndDissolveGridSquareStep1(process_parameters):
     """
     Process single cell of grid square - to allow multiprocessing over multiple cells
@@ -894,21 +927,44 @@ def singleprocessAmalgamateAndDissolveGridSquareStep1(process_parameters):
     target_table, grid_square_index, grid_square_count, grid_square_id, scratch_table_1, processing_grid, children_sql = \
         process_parameters[0], process_parameters[1], process_parameters[2], process_parameters[3], process_parameters[4], process_parameters[5], process_parameters[6]
 
-    LogMessage("STARTING: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count))
+    with global_count.get_lock():
+        LogMessage("STARTING: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count) + " [" + str(global_count.value) + " grid square(s) to be processed]")
 
-    postgisExec("""
-    INSERT INTO %s 
-        SELECT final.id, final.geom
-        FROM
-        (
-            SELECT 
-                grid.id, 
-                (ST_Dump(ST_Intersection(grid.geom, children.geom))).geom geom
-            FROM %s grid, (%s) AS children 
-            WHERE grid.id = %s
-        ) final WHERE ST_geometrytype(final.geom) = 'ST_Polygon';""", (AsIs(scratch_table_1), AsIs(processing_grid), AsIs(children_sql), AsIs(grid_square_id), ))
+    try:
 
-    with global_count.get_lock(): 
+        postgisExec("""
+        INSERT INTO %s 
+            SELECT final.id, final.geom
+            FROM
+            (
+                SELECT 
+                    grid.id, 
+                    (ST_Dump(ST_Intersection(grid.geom, children.geom))).geom geom
+                FROM %s grid, (%s) AS children 
+                WHERE grid.id = %s
+            ) final WHERE ST_geometrytype(final.geom) = 'ST_Polygon';""", (AsIs(scratch_table_1), AsIs(processing_grid), AsIs(children_sql), AsIs(grid_square_id), ))
+
+    except postgiserrors.InternalError as e:
+
+        LogMessage("ERROR using default SQL, retrying with ST_MakeValid wrapper")
+
+        postgisExec("""
+            INSERT INTO %s 
+                SELECT final.id, final.geom
+                FROM (
+                    SELECT 
+                        grid.id, 
+                        (ST_Dump(ST_Intersection(
+                            grid.geom,
+                            ST_MakeValid(children.geom)
+                        ))).geom AS geom
+                    FROM %s grid, (%s) AS children 
+                    WHERE grid.id = %s
+                ) final 
+                WHERE ST_GeometryType(final.geom) = 'ST_Polygon';
+        """, (AsIs(scratch_table_1), AsIs(processing_grid), AsIs(children_sql), AsIs(grid_square_id)))
+
+    with global_count.get_lock():
         global_count.value -= 1
         LogMessage("FINISHED: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count) + " [" + str(global_count.value) + " grid square(s) to be processed]")
 
@@ -920,7 +976,8 @@ def singleprocessAmalgamateAndDissolveGridSquareStep2(process_parameters):
     target_table, grid_square_index, grid_square_count, grid_square_id, scratch_table_1, scratch_table_2 = \
         process_parameters[0], process_parameters[1], process_parameters[2], process_parameters[3], process_parameters[4], process_parameters[5] 
 
-    LogMessage("STARTING: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count))
+    with global_count.get_lock():
+        LogMessage("STARTING: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count) + " [" + str(global_count.value) + " grid square(s) to be processed]")
 
     postgisExec("""
     INSERT INTO %s 
@@ -929,7 +986,7 @@ def singleprocessAmalgamateAndDissolveGridSquareStep2(process_parameters):
         (SELECT (ST_Dump(ST_Union(geom))).geom geom FROM %s AS dataset WHERE id = %s) final 
         WHERE ST_geometrytype(final.geom) = 'ST_Polygon';""", (AsIs(scratch_table_2), AsIs(scratch_table_1), AsIs(grid_square_id), ))
 
-    with global_count.get_lock(): 
+    with global_count.get_lock():
         global_count.value -= 1
         LogMessage("FINISHED: " + target_table + ": Grid square " + str(grid_square_index + 1) + "/" + str(grid_square_count) + " [" + str(global_count.value) + " grid square(s) to be processed]")
 
@@ -1028,6 +1085,8 @@ def multiprocessAmalgamateAndDissolve(amalgamate_parameters):
                 (AsIs(scratch_table_3), AsIs(scratch_table_2), ))
 
     LogMessage(target_table + ": Save dumped geometries")
+
+    # postgisDumpGeometriesInBatches(scratch_table_3, target_table)
     postgisExec("CREATE TABLE %s AS SELECT (ST_Dump(geom)).geom geom FROM %s;", \
                 (AsIs(target_table), AsIs(scratch_table_3), ))
 
@@ -1129,8 +1188,14 @@ def postgisAmalgamateAndDissolve(amalgamate_parameters):
                 (AsIs(scratch_table_3), AsIs(scratch_table_2), ))
 
     LogMessage(prefix + target_table + ": Save dumped geometries")
-    postgisExec("CREATE TABLE %s AS SELECT (ST_Dump(geom)).geom geom FROM %s;", \
-                (AsIs(target_table), AsIs(scratch_table_3), ))
+
+    try:
+        postgisExec("CREATE TABLE %s AS SELECT (ST_Dump(geom)).geom geom FROM %s;", \
+                    (AsIs(target_table), AsIs(scratch_table_3), ))
+    except postgiserrors.InternalError_ as e:
+        LogMessage("Postgis error: Geometry possibly too complex - simplifying")
+        postgisExec("CREATE TABLE %s AS SELECT (ST_Dump(ST_Simplify(geom, 0.00001))).geom AS geom FROM %s;", 
+                    (AsIs(target_table), AsIs(scratch_table_3),))
 
     postgisExec("CREATE INDEX %s ON %s USING GIST (geom);", (AsIs(target_table + "_idx"), AsIs(target_table), ))
 
@@ -1612,15 +1677,13 @@ def deleteDatasetTables(dataset, all_tables):
         possible_tables.append(buildProcessedTableName(bufferedTable))
 
     # We update internal array of all_tables to minimise load on PostGIS
-    output_all_tables = []
     for possible_table in possible_tables:
         if possible_table in all_tables:
             LogMessage(" --> Dropping PostGIS table: " + possible_table)
             postgisDropTable(possible_table)
-        else:
-            output_all_tables.append(possible_table)
+            all_tables.remove(possible_table)
 
-    return output_all_tables
+    return all_tables
 
 def deleteAncestors(dataset, all_tables=None):
     """
@@ -1661,7 +1724,9 @@ def deleteDatasetAndAncestors(dataset, all_tables=None):
 
     for ancestor in ancestors:
         deleteDatasetFiles(ancestor)
-        deleteDatasetTables(ancestor, all_tables)
+        all_tables = deleteDatasetTables(ancestor, all_tables)
+
+    return all_tables
 
 def isSpecificDatasetHeightDependent(dataset_name):
     """
@@ -1970,12 +2035,13 @@ def getCKANPackages(ckanurl):
 
         gpkgfound = False
         arcgisfound = False
-        buffer, automation, layer = None, None, None
+        buffer, automation, layer, test = None, None, None, False
         if 'extras' in ckan_package:
             for extra in ckan_package['extras']:
                 if extra['key'] == 'buffer': buffer = extra['value']
                 if extra['key'] == 'automation': automation = extra['value']
                 if extra['key'] == 'layer': layer = extra['value']
+                if extra['key'] == 'test': test = True
 
         if automation == 'exclude': continue
         if automation == 'intersect': continue
@@ -2369,34 +2435,43 @@ def downloadDatasetsSinglePass(ckanurl, output_folder):
 
     if not isfile(osm_export_file): rerun_osm_export_tool = True
 
-    if rerun_osm_export_tool:
-        # Export OSM to GPKG using osm-export-tool
-        LogMessage("Running osm-export-tool with aggregated YML '" + yaml_all_filename + "' on: " + basename(OSM_MAIN_DOWNLOAD))
-        runSubprocess(["osm-export-tool", OSM_DOWNLOADS_FOLDER + basename(OSM_MAIN_DOWNLOAD), osm_export_base, "-m", yaml_all_path])
-
     osm_layers.sort()
     generateOSMLookup(osm_layers)
 
     all_datasets_downloaded = Value('i', 1)
     num_datasets_downloaded = Value('i', 0)
     dataset_index, datasets_queue = 0, []
+
+    # Add osm-export-tool to datasets queue to be processed with multiprocessing
+    # This ensures long-run processes like osm-export-tool start early as possible
+    if rerun_osm_export_tool:
+        dataset_index += 1
+        datasets_queue.append(  {\
+                                'subprocess': ["osm-export-tool", OSM_DOWNLOADS_FOLDER + basename(OSM_MAIN_DOWNLOAD), osm_export_base, "-m", yaml_all_path], \
+                                'log': ("Running osm-export-tool with aggregated YML '" + yaml_all_filename + "' on: " + basename(OSM_MAIN_DOWNLOAD)) \
+                                })
+
+    # Add main downloads to datasets queue to be processed with multiprocessing
     for ckanpackage in ckanpackages.keys():
         for dataset in ckanpackages[ckanpackage]['datasets']:
             dataset_index += 1
-            datasets_queue.append([dataset_index, dataset, output_folder])
+            datasets_queue.append(  { \
+                                    'dataset_index': dataset_index, \
+                                    'dataset': dataset, \
+                                    'output_folder': output_folder \
+                                    })
 
     multiprocessBefore()
 
-    LogMessage("Downloading missing datasets...")
+    LogMessage("Downloading missing datasets or running early-stage data processing...")
 
-    chunksize = int(len(datasets_queue) / multiprocessing.cpu_count()) + 1
-
+    chunksize = 1
     with Pool(processes=getNumberProcesses(), initializer=init_globals_boolean_count, initargs=(all_datasets_downloaded, num_datasets_downloaded, )) as p:
         p.map(downloadDataset, datasets_queue, chunksize=chunksize)
     
     num_downloaded = num_datasets_downloaded.value
     if num_downloaded == 0: LogMessage("All datasets already downloaded")
-    else: LogMessage(str(num_downloaded) + " dataset(s) downloaded in this pass")
+    else: LogMessage(str(num_downloaded) + " dataset(s) downloaded or processed in this pass")
 
     multiprocessAfter()
 
@@ -2409,7 +2484,20 @@ def downloadDataset(dataset_parameters):
 
     global CKAN_USER_AGENT, TEMP_FOLDER
 
-    dataset_index, dataset, output_folder = dataset_parameters[0], dataset_parameters[1], dataset_parameters[2]
+    # Check to see if dataset download is really long-running pre-processing step, eg. osm-export-tool
+    if 'subprocess' in dataset_parameters:
+        LogMessage("STARTING:            " + dataset_parameters['log'])
+        runSubprocess(dataset_parameters['subprocess'])
+        LogMessage("FINISHED:            " + dataset_parameters['log'])
+        with global_count.get_lock(): global_count.value += 1
+        return 
+
+    dataset_index = dataset_parameters['dataset_index']
+    dataset = dataset_parameters['dataset']
+    output_folder = dataset_parameters['output_folder']
+
+    # Don't do anything if osm-export-tool dataset
+    if dataset['type'] == 'osm-export-tool YML': return
 
     dataset_title = reformatDatasetName(dataset['title'])
     feature_name = dataset['title']
@@ -2431,6 +2519,8 @@ def downloadDataset(dataset_parameters):
 
     # If export file(s) already exists, quit
     if isfile(output_file) or isfile(output_gpkg_file): return
+
+    LogMessage("STARTING:            " + feature_name)
 
     if dataset['type'] == 'KML':
 
@@ -2754,6 +2844,8 @@ def downloadDataset(dataset_parameters):
                             "-t_srs", WORKING_CRS])
         os.remove(temp_output_file)
     
+    LogMessage("FINISHED:            " + feature_name)
+
 def deleteFolderContentsKeepFolder(folder):
     """
     Deletes contents of folder but keep folder - needed for when docker compose manages folder mappings
@@ -2834,31 +2926,49 @@ def purgeAll():
 
         shutil.rmtree(subfolder_absolute)
 
-def createGridClippedFile(table_name, core_dataset_name, file_path):
+def createGridClippedFile(parameters):
     """
     Create grid clipped version of file to improve rendering and performance when used as mbtiles
     """
 
     global OUTPUT_GRID_TABLE
 
-    scratch_table_1 = '_scratch_table_1'
+    with global_count.get_lock():
+        LogMessage("STARTING: Create grid-sliced tippecanoe input file for: " + parameters['table_name'] + " [" + str(global_count.value) + " table(s) to be processed]")
+
+    scratch_table_1 = '_scr_' + parameters['table_name']
     output_grid = reformatTableName(OUTPUT_GRID_TABLE)
 
+    # Remove existing file and scratch table
+    if isfile(parameters['tippecanoe_input']): os.remove(parameters['tippecanoe_input'])
     if postgisCheckTableExists(scratch_table_1): postgisDropTable(scratch_table_1)
 
     postgisExec("CREATE TABLE %s AS SELECT (ST_Dump(ST_Intersection(layer.geom, grid.geom))).geom geom FROM %s layer, %s grid;", \
-                (AsIs(scratch_table_1), AsIs(table_name), AsIs(output_grid), ))
+                (AsIs(scratch_table_1), AsIs(parameters['table_name']), AsIs(output_grid), ))
 
     inputs = runSubprocess(["ogr2ogr", \
-                    file_path, \
+                    parameters['tippecanoe_input'], \
                     'PG:host=' + POSTGRES_HOST + ' user=' + POSTGRES_USER + ' password=' + POSTGRES_PASSWORD + ' dbname=' + POSTGRES_DB, \
                     "-overwrite", \
-                    "-nln", core_dataset_name, \
+                    "-nln", parameters['dataset_name'], \
                     scratch_table_1, \
                     "-s_srs", WORKING_CRS, \
                     "-t_srs", 'EPSG:4326'])
 
     if postgisCheckTableExists(scratch_table_1): postgisDropTable(scratch_table_1)
+
+    # Check for no features as GeoJSON with no features causes problem for tippecanoe
+    # If no features, add dummy point so Tippecanoe creates mbtiles
+
+    if os.path.getsize(parameters['tippecanoe_input']) < 1000:
+        with open(parameters['tippecanoe_input'], "r") as json_file: geojson_content = json.load(json_file)
+        if ('features' not in geojson_content) or (len(geojson_content['features']) == 0):
+            geojson_content['features'] = [{"type":"Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0,0]}}]
+            with open(parameters['tippecanoe_input'], "w") as json_file: json.dump(geojson_content, json_file)
+
+    with global_count.get_lock():
+        global_count.value -= 1
+        LogMessage("FINISHED: Create grid-sliced tippecanoe input file for: " + parameters['table_name'] + " [" + str(global_count.value) + " table(s) to be processed]")
 
 def initPipeline(command_line):
     """
@@ -2900,23 +3010,6 @@ def initPipeline(command_line):
     if not postgisCheckTableExists(osm_boundaries_table):
 
         LogMessage("Importing into PostGIS: " + basename(osm_boundaries_gpkg))
-
-        # # Note: clipping on OVERALL_CLIPPING_FILE as some osm boundaries - esp UK nations - are not clipped tightly on coastlines
-        # subprocess_list = [ "ogr2ogr", \
-        #                     "-f", "PostgreSQL", \
-        #                     'PG:host=' + POSTGRES_HOST + ' user=' + POSTGRES_USER + ' password=' + POSTGRES_PASSWORD + ' dbname=' + POSTGRES_DB, \
-        #                     osm_boundaries_gpkg, \
-        #                     "-makevalid", \
-        #                     "-overwrite", \
-        #                     "-lco", "GEOMETRY_NAME=geom", \
-        #                     "-lco", "OVERWRITE=YES", \
-        #                     "-nln", osm_boundaries_table, \
-        #                     "-skipfailures", \
-        #                     "-s_srs", osm_boundaries_projection, \
-        #                     "-t_srs", WORKING_CRS, \
-        #                     "-clipsrc", WORKING_FOLDER + OVERALL_CLIPPING_FILE, \
-        #                     "--config", "OGR_PG_ENABLE_METADATA", "NO", \
-        #                     "--config", "PG_USE_COPY", "YES" ]
 
         scratch_table_1 = '_scratch_table_clipping'
         scratch_table_2 = '_scratch_table_preclipped_boundaries'
@@ -3211,7 +3304,7 @@ def processDataset(dataset_parameters):
         if postgisCheckTableExists(scratch_table_2): postgisDropTable(scratch_table_2)
         if postgisCheckTableExists(scratch_table_3): postgisDropTable(scratch_table_3)
 
-    with global_count.get_lock(): 
+    with global_count.get_lock():
         global_count.value -= 1
         LogMessage(prefix + "FINISHED: Processed table: " + processed_table + " [" + str(global_count.value) + " dataset(s) to be processed]")
 
@@ -3424,6 +3517,8 @@ def runProcessingOnDownloads(output_folder):
 
     current_datasets = getStructureDatasets()
     downloaded_files = getFilesInFolder(output_folder)
+
+    # Create in-memory list of PostGIS tables and update whenever table dropped to save time
     all_tables = postgisGetAllTables()
     
     queue_index, queue_dict, queue_import = 1, {}, []
@@ -3446,24 +3541,27 @@ def runProcessingOnDownloads(output_folder):
             if core_dataset_name not in current_datasets: continue
 
         # If importing dataset, delete import table and all derived files and tables as data may have changed
-        if tableexists: postgisDropTable(imported_table)
+        if tableexists: 
+            postgisDropTable(imported_table)
+            all_tables.remove(imported_table)
+
+        # Important to update all_tables (list of active PostGIS tables) in case deleteAncestors drops tables
         all_tables = deleteAncestors(imported_table, all_tables)
 
-        file_size = os.path.getsize(join(output_folder, downloaded_file))
-        processing_priority = file_size
-        if downloaded_file.endswith('.geojson'): processing_priority = (4 * processing_priority)
-        queue_dict_index = str(processing_priority) + "." + str(queue_index)
+        priority = os.path.getsize(join(output_folder, downloaded_file))
+        if downloaded_file.endswith('.geojson'): priority = (4 * priority)
+        queue_dict_index = getQueueKey(priority, queue_index)
         queue_dict[queue_dict_index] = [downloaded_file, output_folder, imported_table, core_dataset_name]
-        queue_import.append([downloaded_file, output_folder, imported_table, core_dataset_name])
 
-    if len(queue_import) != 0:
+    if len(queue_dict) != 0:
+
+        queue_dict = dict(sorted(queue_dict.items(), reverse=True))
+        queue_datasets = [queue_dict[item] for item in queue_dict]
+        chunksize = 1
 
         multiprocessBefore()
 
-        chunksize = math.ceil(len(queue_import) / (4 * multiprocessing.cpu_count()))
-        queue_import = multiprocessDivideChunks(queue_dict, chunksize)
-
-        with Pool(processes=getNumberProcesses()) as p: p.map(importDataset, queue_import, chunksize=chunksize)
+        with Pool(processes=getNumberProcesses()) as p: p.map(importDataset, queue_datasets, chunksize=chunksize)
 
         multiprocessAfter()
 
@@ -3499,22 +3597,20 @@ def runProcessingOnDownloads(output_folder):
                 parents_lookup[parent].append(processed_table)
 
                 priority = priority_multiplier * postgisGetTableSize(orig_table)
-                queue_dict_index = str(priority) + "." + str(queue_index)
+                queue_dict_index = getQueueKey(priority, queue_index)
                 queue_dict[queue_dict_index] = [queue_index, dataset_name, clipping_union_table, REGENERATE_OUTPUT, HEIGHT_TO_TIP, BLADE_RADIUS, CUSTOM_CONFIGURATION]
 
     if len(queue_dict) != 0:
 
         num_datasets_to_process = Value('i', len(queue_dict))
-        chunksize = math.ceil(len(queue_dict) / (4 * multiprocessing.cpu_count()))
-        queue_datasets = multiprocessDivideChunks(queue_dict, chunksize)
+        queue_dict = dict(sorted(queue_dict.items(), reverse=True))
+        queue_datasets = [queue_dict[item] for item in queue_dict]
+        chunksize = 1
 
         multiprocessBefore()
 
         with Pool(processes=getNumberProcesses(), initializer=init_globals_count, initargs=(num_datasets_to_process, )) as p:
             p.map(processDataset, queue_datasets, chunksize=chunksize)
-
-        # with Pool(processes=getNumberProcesses(), initializer=init_globals_count, initargs=(num_datasets_to_process, )) as p:
-        #     p.map(processDataset, queue_datasets)
 
         multiprocessAfter()
 
@@ -3526,35 +3622,34 @@ def runProcessingOnDownloads(output_folder):
 
     LogMessage("Amalgamating and dissolving layers with common parents...")
 
-    amalgamate_id, finallayers, queue_dict = 0, [], {}
+    queue_index, finallayers, queue_dict = 0, [], {}
     parents = parents_lookup.keys()
     for parent in parents:
         parent_table = buildFinalLayerTableName(parent)
         finallayers.append(reformatDatasetName(parent_table))
         parent_table_exists = postgisCheckTableExists(parent_table)
         if REGENERATE_OUTPUT or (not parent_table_exists):
-            amalgamate_id += 1
+            queue_index += 1
             amalgamate_output = "Amalgamating and dissolving children of parent: " + parent
             if parent_table_exists: postgisDropTable(parent_table)
             # Delete any tables and files that are derived from this table
             deleteDatasetAndAncestors(parent_table)
-            table_size_children = 0
-            for child in parents_lookup[parent]: table_size_children += postgisGetTableSize(child)
-            queue_dict_index = str(table_size_children) + "." + str(amalgamate_id)
-            queue_dict[queue_dict_index] = [amalgamate_id, amalgamate_output, parent_table, parents_lookup[parent], PROCESSING_GRID_TABLE, CUSTOM_CONFIGURATION]
+            priority = 0
+            for child in parents_lookup[parent]: priority += postgisGetTableSize(child)
+            queue_dict_index = getQueueKey(priority, queue_index)
+            queue_dict[queue_dict_index] = [queue_index, amalgamate_output, parent_table, parents_lookup[parent], PROCESSING_GRID_TABLE, CUSTOM_CONFIGURATION]
 
     if len(queue_dict) != 0:
 
         num_datasets_to_process = Value('i', len(queue_dict))
-        chunksize = int(len(queue_dict) / multiprocessing.cpu_count()) + 1
-        queue_amalgamate = multiprocessDivideChunks(queue_dict, chunksize)
-
-        print(json.dumps(queue_amalgamate, indent=4))
+        queue_dict = dict(sorted(queue_dict.items(), reverse=True))
+        queue_datasets = [queue_dict[item] for item in queue_dict]
+        chunksize = 1
 
         multiprocessBefore()
 
         with Pool(processes=getNumberProcesses(), initializer=init_globals_count, initargs=(num_datasets_to_process, )) as p:
-            p.map(postgisAmalgamateAndDissolve, queue_amalgamate, chunksize=chunksize)
+            p.map(postgisAmalgamateAndDissolve, queue_datasets, chunksize=chunksize)
 
         multiprocessAfter()
 
@@ -3566,7 +3661,7 @@ def runProcessingOnDownloads(output_folder):
 
     LogMessage("Amalgamating and dissolving layers by group...")
 
-    amalgamate_id, queue_dict = 0, {}
+    queue_index, queue_dict = 0, {}
     for group in groups:
         group_items = list((structure_lookup[group]).keys())
         if group_items is None: continue
@@ -3575,7 +3670,7 @@ def runProcessingOnDownloads(output_folder):
         group_table_exists = postgisCheckTableExists(group_table)
         group_items.sort()
         if REGENERATE_OUTPUT or (not group_table_exists):
-            amalgamate_id += 1
+            queue_index += 1
             amalgamate_output = "Amalgamating and dissolving datasets of group: " + group
             # Don't do anything if there is only one element with same name as group
             if (len(group_items) == 1) and (group == group_items[0]): continue
@@ -3583,21 +3678,22 @@ def runProcessingOnDownloads(output_folder):
             # Delete any tables and files that are derived from this table
             deleteDatasetAndAncestors(group_table)
             children = [buildFinalLayerTableName(table_name) for table_name in group_items]
-            table_size_children = 0
-            for child in children: table_size_children += postgisGetTableSize(child)
-            queue_dict_index = str(table_size_children) + "." + str(amalgamate_id)
-            queue_dict[queue_dict_index] = [amalgamate_id, amalgamate_output, group_table, children, PROCESSING_GRID_TABLE, CUSTOM_CONFIGURATION]
+            priority = 0
+            for child in children: priority += postgisGetTableSize(child)
+            queue_dict_index = getQueueKey(priority, queue_index)
+            queue_dict[queue_dict_index] = [queue_index, amalgamate_output, group_table, children, PROCESSING_GRID_TABLE, CUSTOM_CONFIGURATION]
 
     if len(queue_dict) != 0:
 
         num_datasets_to_process = Value('i', len(queue_dict))
-        chunksize = int(len(queue_dict) / multiprocessing.cpu_count()) + 1
-        queue_amalgamate = multiprocessDivideChunks(queue_dict, chunksize)
+        queue_dict = dict(sorted(queue_dict.items(), reverse=True))
+        queue_datasets = [queue_dict[item] for item in queue_dict]
+        chunksize = 1
 
         multiprocessBefore()
 
         with Pool(processes=getNumberProcesses(), initializer=init_globals_count, initargs=(num_datasets_to_process, )) as p:
-            p.map(postgisAmalgamateAndDissolve, queue_amalgamate, chunksize=chunksize)
+            p.map(postgisAmalgamateAndDissolve, queue_datasets, chunksize=chunksize)
 
         multiprocessAfter()
 
@@ -3806,7 +3902,9 @@ def installTileserverFonts():
     else:
 
         # Server build clones fonts from https://github.com/open-wind/openmaptiles-fonts.git
-        if isdir(tileserver_font_folder): return True
+        if isdir(tileserver_font_folder): 
+            LogMessage("Tileserver fonts folder already exists - SUCCESS")
+            return True
 
         # Download tileserver fonts
 
@@ -3839,12 +3937,17 @@ def installTileserverFonts():
 
         return True
 
+def generateTippecanoeInput():
+    """
+    Generates grid-sliced GeoJSON ready for Tippecanoe
+    """
+
 def buildTileserverFiles():
     """
     Builds files required for tileserver-gl
     """
 
-    global  CUSTOM_CONFIGURATION, CUSTOM_CONFIGURATION_FILE_PREFIX, LATEST_OUTPUT_FILE_PREFIX
+    global  CUSTOM_CONFIGURATION, CUSTOM_CONFIGURATION_FILE_PREFIX, LATEST_OUTPUT_FILE_PREFIX, TEMP_FOLDER
     global  OVERALL_CLIPPING_FILE, TILESERVER_URL, TILESERVER_FONTS_GITHUB, TILESERVER_SRC_FOLDER, TILESERVER_FOLDER, TILESERVER_DATA_FOLDER, TILESERVER_STYLES_FOLDER, \
             OSM_DOWNLOADS_FOLDER, OSM_MAIN_DOWNLOAD, BUILD_FOLDER, FINALLAYERS_OUTPUT_FOLDER, FINALLAYERS_CONSOLIDATED, MAPAPP_FOLDER
     global  TILEMAKER_COASTLINE_CONFIG, TILEMAKER_COASTLINE_PROCESS, TILEMAKER_OMT_CONFIG, TILEMAKER_OMT_PROCESS, SKIP_FONTS_INSTALLATION, OPENMAPTILES_HOSTED_FONTS
@@ -3856,6 +3959,7 @@ def buildTileserverFiles():
     makeFolder(TILESERVER_FOLDER)
     makeFolder(TILESERVER_DATA_FOLDER)
     makeFolder(TILESERVER_STYLES_FOLDER)
+    makeFolder(TEMP_FOLDER)
 
     # Legacy issue: housekeeping of final output and tileserver folders due to shortening of
     # specific dataset names leaving old files with old names that cause problems
@@ -3996,8 +4100,10 @@ def buildTileserverFiles():
 
     # Tippecanoe is used to create mbtiles for all 'latest--...' / 'custom--latest...' GeoJSONs
 
+    queue_index, queue_dict = 0, {}
     output_files.insert(0, overallconstraints)
     for output_file in output_files:
+        queue_index += 1
 
         # Only process GeoJSONs with required_prefix
         if (not output_file.startswith(required_prefix)) or (not output_file.endswith('.geojson')): continue
@@ -4037,38 +4143,19 @@ def buildTileserverFiles():
 
         if not isfile(tippecanoe_output):
 
-            LogMessage("Creating mbtiles for: " + output_file)
-
-            tippecanoe_grid_clipped_file = 'tippecanoe--grid-clipped--temp.geojson'
-
-            if isfile(tippecanoe_grid_clipped_file): os.remove(tippecanoe_grid_clipped_file)
-
-            createGridClippedFile(original_table_name, core_dataset_name, tippecanoe_grid_clipped_file)
-
-            # Check for no features as GeoJSON with no features causes problem for tippecanoe
-            # If no features, add dummy point so Tippecanoe creates mbtiles
-
-            if os.path.getsize(tippecanoe_grid_clipped_file) < 1000:
-                with open(tippecanoe_grid_clipped_file, "r") as json_file: geojson_content = json.load(json_file)
-                if ('features' not in geojson_content) or (len(geojson_content['features']) == 0):
-                    geojson_content['features'] = [{"type":"Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0,0]}}]
-                    with open(tippecanoe_grid_clipped_file, "w") as json_file: json.dump(geojson_content, json_file)
-
-            inputs = runSubprocess(["tippecanoe", \
-                                    "-Z4", "-z15", \
-                                    "-X", \
-                                    "--generate-ids", \
-                                    "--force", \
-                                    "-n", style_name, \
-                                    "-l", derived_dataset_name, \
-                                    tippecanoe_grid_clipped_file, \
-                                    "-o", tippecanoe_output ])
-
-            if isfile(tippecanoe_grid_clipped_file): os.remove(tippecanoe_grid_clipped_file)
-
-        if not isfile(tippecanoe_output):
-            LogError("Failed to create mbtiles: " + basename(tippecanoe_output))
-            LogFatalError("*** Aborting process *** ")
+            tippecanoe_grid_clipped_file = join(TEMP_FOLDER,  'tippecanoe--grid-clipped--' + core_dataset_name + '.geojson')
+            queue_parameters =  { \
+                                    'dataset_name': core_dataset_name, \
+                                    'derived_dataset_name': derived_dataset_name, \
+                                    'table_name': original_table_name, \
+                                    'style_name': style_name, \
+                                    'tippecanoe_input': tippecanoe_grid_clipped_file, \
+                                    'tippecanoe_output': tippecanoe_output
+                                }
+            
+            priority = os.path.getsize(join(FINALLAYERS_OUTPUT_FOLDER, output_file))
+            queue_dict_index = getQueueKey(priority, queue_index)
+            queue_dict[queue_dict_index] = queue_parameters
 
         LogMessage("Created tileserver-gl style file for: " + output_file)
 
@@ -4129,6 +4216,20 @@ def buildTileserverFiles():
             "mbtiles": basename(tippecanoe_output)
         }
 
+    # Run multiprocessing to create Tippecanoe grid-sliced input files
+
+    num_items_to_process = Value('i', len(queue_dict))
+    queue_dict = dict(sorted(queue_dict.items(), reverse=True))
+    queue_items = [queue_dict[item] for item in queue_dict]
+    chunksize = 1
+
+    multiprocessBefore()
+
+    with Pool(processes=getNumberProcesses(), initializer=init_globals_count, initargs=(num_items_to_process, )) as p:
+        p.map(createGridClippedFile, queue_items, chunksize=chunksize)
+
+    multiprocessAfter()
+
     with open(openwind_style_file, "w") as json_file: json.dump(openwind_style_json, json_file, indent=4)
 
     # Creating final tileserver-gl config file
@@ -4162,7 +4263,29 @@ def buildTileserverFiles():
             "data": data
         }
 
+    for item in queue_items:
+            
+        LogMessage("Creating mbtiles for: " + item['table_name'])
+
+        inputs = runSubprocess(["tippecanoe", \
+                                "-Z4", "-z15", \
+                                "-X", \
+                                "--generate-ids", \
+                                "--force", \
+                                "-n", item['style_name'], \
+                                "-l", item['derived_dataset_name'], \
+                                item['tippecanoe_input'], \
+                                "-o", item['tippecanoe_output'] ])
+
+        if isfile(item['tippecanoe_input']): os.remove(item['tippecanoe_input'])
+
+        if not isfile(item['tippecanoe_output']):
+            LogError("Failed to create mbtiles: " + basename(item['tippecanoe_output']))
+            LogFatalError("*** Aborting process *** ")
+
     with open(config_file, "w") as json_file: json.dump(config_json, json_file, indent=4)
+
+    if isdir(TEMP_FOLDER): shutil.rmtree(TEMP_FOLDER)
 
     LogMessage("All tileserver files created")
 
